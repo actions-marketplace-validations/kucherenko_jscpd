@@ -40,7 +40,7 @@ fn clone_to_dup(
         .saturating_sub(clone.fragment_a.start.line)
         + 1;
 
-    let frag_a = read_file_cached(file_cache, &clone.fragment_a.source_id);
+    let frag_a = read_file_cached(file_cache, &clone.fragment_a);
     let fragment = extract_lines(
         frag_a,
         clone.fragment_a.start.line,
@@ -84,6 +84,7 @@ fn clone_to_dup(
         "tokens": clone.token_count,
         "firstFile": first_file,
         "secondFile": second_file,
+        "isNew": clone.is_new,
     })
 }
 
@@ -104,10 +105,16 @@ impl Reporter for JsonReporter {
             .map(|c| clone_to_dup(c, self.blame, &mut file_cache))
             .collect();
 
-        let value = json!({
+        let mut value = json!({
             "statistics": ctx.stats,
             "duplicates": duplicates,
         });
+        // Additive only: the key is absent unless --summary was requested,
+        // so the report schema is unchanged for existing consumers.
+        if let Some(summary) = ctx.summary {
+            value["summary"] =
+                serde_json::to_value(summary).map_err(|e| ReporterError::Format(e.to_string()))?;
+        }
 
         let content = serde_json::to_string_pretty(&value)
             .map_err(|e| ReporterError::Format(e.to_string()))?;
@@ -212,6 +219,7 @@ mod tests {
         let ctx = ReportContext {
             stats,
             duration: Duration::ZERO,
+            summary: None,
         };
         reporter.report(clones, &ctx, &dir).unwrap();
         std::fs::read_to_string(dir.join("jscpd-report.json")).unwrap()
@@ -307,6 +315,17 @@ mod tests {
             total.get("newClones").is_some(),
             "statistics must include newClones"
         );
+    }
+
+    #[test]
+    fn json_duplicate_includes_is_new() {
+        let mut new_clone = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        new_clone.is_new = true;
+        let known_clone = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        let content = run_json_report(&[new_clone, known_clone], false);
+        let parsed = parse_json_report(&content);
+        assert_eq!(parsed["duplicates"][0]["isNew"], true);
+        assert_eq!(parsed["duplicates"][1]["isNew"], false);
     }
 
     #[test]

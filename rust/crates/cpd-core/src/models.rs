@@ -59,6 +59,8 @@ pub struct BlameEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fragment {
     pub source_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_root: Option<String>,
     pub start: Location,
     pub end: Location,
     pub range: [u32; 2],
@@ -71,6 +73,10 @@ pub struct CpdClone {
     pub fragment_a: Fragment,
     pub fragment_b: Fragment,
     pub token_count: u32,
+    /// True when the clone is absent from the configured baseline (issue #944).
+    /// Always false when no baseline is in use.
+    #[serde(default)]
+    pub is_new: bool,
 }
 
 /// Internal detection unit — no heap allocation per token.
@@ -95,6 +101,10 @@ pub struct SourceFile {
     pub id: String,
     pub format: String,
     pub tokens: Vec<Token>,
+    /// File size in bytes. Zero for synthetic sub-format sources
+    /// (embedded code blocks) whose bytes are counted by the parent file.
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 /// Per-format or total statistics row.
@@ -191,6 +201,7 @@ mod tests {
         };
         let frag = Fragment {
             source_id: "a.js".to_string(),
+            source_root: None,
             start: loc.clone(),
             end: loc.clone(),
             range: [0, 10],
@@ -201,6 +212,7 @@ mod tests {
             fragment_a: frag.clone(),
             fragment_b: frag,
             token_count: 50,
+            is_new: false,
         };
         let json = serde_json::to_string(&clone).unwrap();
         assert!(json.contains("abc123"));
@@ -216,6 +228,7 @@ mod tests {
         };
         let frag = Fragment {
             source_id: "b.js".to_string(),
+            source_root: None,
             start: loc.clone(),
             end: loc.clone(),
             range: [0, 5],

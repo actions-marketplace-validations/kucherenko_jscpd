@@ -150,11 +150,10 @@ impl Reporter for XmlReporter {
 mod tests {
     use super::*;
     use crate::assert_empty_report_ok;
-    use crate::context::ReportContext;
+
     use crate::reporter::ReporterOptions;
-    use crate::shared::fixtures::{empty_ctx, empty_stats, tmp_dir};
+    use crate::shared::fixtures::{empty_ctx, tmp_dir};
     use cpd_core::models::{CpdClone, Fragment, Location};
-    use std::time::Duration;
 
     assert_empty_report_ok!(empty_clones_produces_valid_xml, XmlReporter);
 
@@ -176,6 +175,7 @@ mod tests {
         };
         let frag_a = Fragment {
             source_id: file_a_str.clone(),
+            source_root: None,
             start: loc_start,
             end: loc_end,
             range: [0, 15],
@@ -196,6 +196,7 @@ mod tests {
         };
         let frag_b = Fragment {
             source_id: file_b_str,
+            source_root: None,
             start: loc_b_start,
             end: loc_b_end,
             range: [0, 15],
@@ -206,6 +207,7 @@ mod tests {
             fragment_a: frag_a,
             fragment_b: frag_b,
             token_count: 50,
+            is_new: false,
         };
         let opts = ReporterOptions::new(dir.clone());
         let reporter = XmlReporter::new(&opts);

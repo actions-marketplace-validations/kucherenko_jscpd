@@ -5,14 +5,18 @@
 // 2. Fixture data provides realistic clone detection scenarios
 //
 // Test Coverage:
-// - json, xml, csv, markdown, sarif, html reporters (file-based)
+// - json, xml, csv, markdown, sarif, openmetrics, html reporters (file-based)
 // - console, console-full, xcode reporters (stdout-based)
 // - silent, threshold, badge, ai reporters (special behavior)
 
 use cpd_core::models::{CpdClone, Fragment, Location, StatRow, Statistics};
 use cpd_reporter::context::ReportContext;
 use cpd_reporter::reporter::{Reporter, ReporterOptions, create_reporter};
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 // ============================================================================
 // Fixture Data - Sample clone detection results
@@ -68,6 +72,7 @@ fn make_test_clone() -> CpdClone {
         format: "javascript".to_string(),
         fragment_a: Fragment {
             source_id: "src/app.js".to_string(),
+            source_root: None,
             start: start_loc.clone(),
             end: end_loc.clone(),
             range: [100, 200],
@@ -75,12 +80,14 @@ fn make_test_clone() -> CpdClone {
         },
         fragment_b: Fragment {
             source_id: "src/utils.js".to_string(),
+            source_root: None,
             start: start_loc,
             end: end_loc,
             range: [100, 200],
             blame: None,
         },
         token_count: 50,
+        is_new: false,
     }
 }
 
@@ -88,13 +95,69 @@ fn make_test_clone() -> CpdClone {
 // Test Helper Functions
 // ============================================================================
 
+const SNIPPET_MARKER: &str = "test_snippet_marker_xyzzy";
+
 fn create_test_output_dir(test_name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("cpd-reporter-test-{}", test_name));
+    let dir = std::env::temp_dir().join(format!(
+        "cpd-reporter-test-{}-{}",
+        test_name,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("Failed to create test output dir");
     dir
 }
 
-fn assert_file_exists(output_dir: &PathBuf, filename: &str) {
+/// Create a clone backed by real files on disk so reporters can read snippets.
+fn make_test_clone_with_real_files(dir: &Path) -> CpdClone {
+    let code = format!(
+        "function hello() {{\n  console.log(\"{}\");\n  return 42;\n}}\n",
+        SNIPPET_MARKER
+    );
+    let file_a = dir.join("a.js");
+    let file_b = dir.join("b.js");
+    std::fs::write(&file_a, &code).expect("write a.js");
+    std::fs::write(&file_b, &code).expect("write b.js");
+
+    CpdClone {
+        format: "javascript".to_string(),
+        fragment_a: Fragment {
+            source_id: file_a.to_string_lossy().into_owned(),
+            source_root: None,
+            start: Location {
+                line: 1,
+                column: 0,
+                offset: 0,
+            },
+            end: Location {
+                line: 4,
+                column: 1,
+                offset: code.len() as u32,
+            },
+            range: [0, 100],
+            blame: None,
+        },
+        fragment_b: Fragment {
+            source_id: file_b.to_string_lossy().into_owned(),
+            source_root: None,
+            start: Location {
+                line: 1,
+                column: 0,
+                offset: 0,
+            },
+            end: Location {
+                line: 4,
+                column: 1,
+                offset: code.len() as u32,
+            },
+            range: [0, 100],
+            blame: None,
+        },
+        token_count: 50,
+        is_new: false,
+    }
+}
+
+fn assert_file_exists(output_dir: &Path, filename: &str) {
     let file_path = output_dir.join(filename);
     assert!(
         file_path.exists(),
@@ -104,7 +167,7 @@ fn assert_file_exists(output_dir: &PathBuf, filename: &str) {
     );
 }
 
-fn read_output_file(output_dir: &PathBuf, filename: &str) -> String {
+fn read_output_file(output_dir: &Path, filename: &str) -> String {
     let file_path = output_dir.join(filename);
     std::fs::read_to_string(&file_path)
         .unwrap_or_else(|_| panic!("Failed to read file {:?}", file_path))
@@ -258,6 +321,17 @@ fn sarif_reporter_creates_output_file() {
 }
 
 #[test]
+fn openmetrics_reporter_creates_output_file() {
+    run_file_reporter(
+        "openmetrics",
+        "openmetrics",
+        "jscpd-metrics.txt",
+        &["jscpd_duplicated_lines", "format=\"javascript\"", "# EOF"],
+        "OpenMetrics report",
+    );
+}
+
+#[test]
 fn ai_reporter_succeeds() {
     run_stdout_reporter("ai");
 }
@@ -281,4 +355,65 @@ fn threshold_reporter_runs() {
     let clones = vec![make_test_clone()];
 
     let _ = reporter.report(&clones, &ctx, &PathBuf::from("/tmp"));
+}
+
+// ============================================================================
+// Snippet content tests — verify reporters read files and include code
+// ============================================================================
+
+#[test]
+fn json_report_contains_snippet_text() {
+    let output_dir = create_test_output_dir("json-snippet");
+    let clone = make_test_clone_with_real_files(&output_dir);
+    let opts = ReporterOptions::new(output_dir.clone());
+    let reporter = create_reporter("json", &opts).unwrap();
+    let ctx = make_test_ctx();
+
+    reporter
+        .report(&[clone], &ctx, &output_dir)
+        .expect("json reporter must succeed");
+
+    let content = read_output_file(&output_dir, "jscpd-report.json");
+    assert!(
+        content.contains(SNIPPET_MARKER),
+        "JSON fragment must contain source code, got empty snippet"
+    );
+}
+
+#[test]
+fn html_report_contains_snippet_text() {
+    let output_dir = create_test_output_dir("html-snippet");
+    let clone = make_test_clone_with_real_files(&output_dir);
+    let opts = ReporterOptions::new(output_dir.clone());
+    let reporter = create_reporter("html", &opts).unwrap();
+    let ctx = make_test_ctx();
+
+    reporter
+        .report(&[clone], &ctx, &output_dir)
+        .expect("html reporter must succeed");
+
+    let content = read_output_file(&output_dir, "jscpd-report.html");
+    assert!(
+        content.contains(SNIPPET_MARKER),
+        "HTML report must contain source code, got empty snippet"
+    );
+}
+
+#[test]
+fn xml_report_contains_snippet_text() {
+    let output_dir = create_test_output_dir("xml-snippet");
+    let clone = make_test_clone_with_real_files(&output_dir);
+    let opts = ReporterOptions::new(output_dir.clone());
+    let reporter = create_reporter("xml", &opts).unwrap();
+    let ctx = make_test_ctx();
+
+    reporter
+        .report(&[clone], &ctx, &output_dir)
+        .expect("xml reporter must succeed");
+
+    let content = read_output_file(&output_dir, "jscpd-report.xml");
+    assert!(
+        content.contains(SNIPPET_MARKER),
+        "XML report must contain source code, got empty snippet"
+    );
 }

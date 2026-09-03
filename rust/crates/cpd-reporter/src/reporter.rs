@@ -12,6 +12,13 @@ pub struct ReporterOptions {
     pub no_colors: bool,
     pub blame_data: BlameMap,
     pub absolute: bool,
+    /// Version stamped into reports (SARIF `tool.driver.version`, HTML footer).
+    /// Binaries must set this to their own crate version — the default is
+    /// cpd-reporter's version, which is not what `cpd --version` prints.
+    pub tool_version: String,
+    /// Clones with at least this many tokens are reported at SARIF level
+    /// "error"; smaller clones (or all clones when None) stay "warning".
+    pub sarif_error_tokens: Option<u32>,
 }
 
 impl ReporterOptions {
@@ -23,6 +30,8 @@ impl ReporterOptions {
             no_colors: false,
             blame_data: BlameMap::new(),
             absolute: false,
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            sarif_error_tokens: None,
         }
     }
 }
@@ -127,6 +136,9 @@ pub fn create_reporter(name: &str, options: &ReporterOptions) -> Option<Box<dyn 
         )),
         "json" => Some(Box::new(crate::json_reporter::JsonReporter::new(options))),
         "sarif" => Some(Box::new(crate::sarif::SarifReporter::new(options))),
+        "codeclimate" | "gitlab" => Some(Box::new(crate::codeclimate::CodeClimateReporter::new(
+            options,
+        ))),
         "ai" => Some(Box::new(crate::ai::AiReporter::new(options))),
         "xml" => Some(Box::new(crate::xml_reporter::XmlReporter::new(options))),
         "csv" => Some(Box::new(crate::csv_reporter::CsvReporter::new(options))),
@@ -135,6 +147,9 @@ pub fn create_reporter(name: &str, options: &ReporterOptions) -> Option<Box<dyn 
             options,
         ))),
         "badge" => Some(Box::new(crate::badge::BadgeReporter::new(options))),
+        "openmetrics" => Some(Box::new(crate::openmetrics::OpenMetricsReporter::new(
+            options,
+        ))),
         "xcode" => Some(Box::new(crate::xcode::XcodeReporter::new(options))),
         "threshold" => Some(Box::new(crate::threshold::ThresholdReporter::new(options))),
         "silent" => Some(Box::new(crate::silent::SilentReporter::new(options))),
@@ -168,6 +183,16 @@ mod tests {
         let r = create_reporter("full", &opts);
         assert!(r.is_some());
         assert_eq!(r.unwrap().name(), "console-full");
+    }
+
+    #[test]
+    fn create_reporter_codeclimate_alias_gitlab() {
+        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
+        for name in ["codeclimate", "gitlab"] {
+            let r = create_reporter(name, &opts);
+            assert!(r.is_some(), "reporter '{name}' must resolve");
+            assert_eq!(r.unwrap().name(), "codeclimate");
+        }
     }
 
     #[test]
@@ -232,9 +257,9 @@ mod tests {
         impl Reporter for TestReporter {
             fn report(
                 &self,
-                clones: &[CpdClone],
+                _clones: &[CpdClone],
                 ctx: &ReportContext,
-                output_dir: &Path,
+                _output_dir: &Path,
             ) -> Result<(), ReporterError> {
                 // Verify we can access timing data from context
                 let _duration = ctx.duration;
@@ -247,7 +272,6 @@ mod tests {
             }
         }
 
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
         let reporter = TestReporter;
         let stats = empty_stats();
         let ctx = ReportContext::new(&stats, Duration::from_millis(100));

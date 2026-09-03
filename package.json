@@ -1,55 +1,18 @@
 {
-  "name": "jscpd-monorepo",
+  "name": "jscpd-repo",
   "private": true,
+  "version": "5.1.1",
+  "description": "jscpd repository root. Not published: exists so `pre-commit` (language: node) can install the repository and get the `jscpd` binary; the engine lives in rust/.",
   "homepage": "https://jscpd.dev",
-  "packageManager": "pnpm@10.28.0",
-  "npmClient": "pnpm",
-  "useWorkspaces": true,
-  "version": "4.2.5",
-  "scripts": {
-    "build": "turbo run build",
-    "commit": "cz",
-    "generate": "turbo run generate",
-    "dev": "turbo run dev --parallel",
-    "lint": "turbo run lint",
-    "lint:fix": "turbo run lint:fix",
-    "test": "turbo run test",
-    "cleanup": "turbo run cleanup",
-    "typecheck": "turbo run typecheck",
-    "publish-packages": "changeset publish"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kucherenko/jscpd.git"
   },
-  "devDependencies": {
-    "@changesets/cli": "^2.31.0",
-    "commitizen": "^4.3.1",
-    "cz-conventional-changelog": "^3.3.0",
-    "turbo": "^2.9.14"
-  },
-  "config": {
-    "commitizen": {
-      "path": "cz-conventional-changelog"
-    }
-  },
-  "readmeFilename": "README.md",
+  "license": "MIT",
   "dependencies": {
-    "@vitest/coverage-v8": "^4.1.8"
+    "jscpd": "5.1.1"
   },
-  "pnpm": {
-    "overrides": {
-      "lodash": "^4.18.1",
-      "minimatch@<3.1.3": "3.1.5",
-      "tmp": "^0.2.6",
-      "fast-uri": "^3.1.2",
-      "diff": "^4.0.4",
-      "rollup": "^4.60.3",
-      "postcss": "^8.5.14",
-      "@isaacs/brace-expansion": "^5.0.1",
-      "vite": "^6.4.2",
-      "glob@>=10.2.0 <10.5.0": "^10.5.0",
-      "ajv": "^8.18.0",
-      "brace-expansion@<1.1.13": "^1.1.13",
-      "vitest": "^4.1.0",
-      "esbuild": "^0.28.1",
-      "qs": "^6.15.2"
-    }
+  "engines": {
+    "node": ">=20"
   }
 }

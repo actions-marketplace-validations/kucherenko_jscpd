@@ -20,12 +20,21 @@ fn skip_if_no_parity() -> bool {
 }
 
 fn cpd_bin() -> PathBuf {
+    // Cargo sets CARGO_BIN_EXE_cpd for integration tests; prefer it because
+    // it already points at the correct target directory and executable suffix.
+    if let Ok(bin) = std::env::var("CARGO_BIN_EXE_cpd") {
+        return PathBuf::from(bin);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .join("target/debug/cpd")
+        .join(if cfg!(target_os = "windows") {
+            "target/debug/cpd.exe"
+        } else {
+            "target/debug/cpd"
+        })
 }
 
 fn jscpd_bin() -> &'static str {

@@ -9,8 +9,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
-  checks: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -27,7 +25,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read version
         id: version
@@ -45,54 +43,71 @@ jobs:
     needs: version
     runs-on: ${{ matrix.target.runner }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm publish --provenance
+      checks: write # dorny/test-reporter posts check runs
     strategy:
       fail-fast: false
       max-parallel: 6
       matrix:
         target:
           - key: linux-x64-gnu
-            packageName: cpd-linux-x64-gnu
+            packageName: jscpd-linux-x64-gnu
             os: linux
             cpu: x64
             libc: glibc
             rustTarget: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
           - key: linux-arm64-gnu
-            packageName: cpd-linux-arm64-gnu
+            packageName: jscpd-linux-arm64-gnu
             os: linux
             cpu: arm64
             libc: glibc
             rustTarget: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
           - key: linux-x64-musl
-            packageName: cpd-linux-x64-musl
+            packageName: jscpd-linux-x64-musl
             os: linux
             cpu: x64
             libc: musl
             rustTarget: x86_64-unknown-linux-musl
             runner: ubuntu-latest
+          - key: linux-arm64-musl
+            packageName: jscpd-linux-arm64-musl
+            os: linux
+            cpu: arm64
+            libc: musl
+            rustTarget: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
           - key: darwin-arm64
-            packageName: cpd-darwin-arm64
+            packageName: jscpd-darwin-arm64
             os: darwin
             cpu: arm64
             rustTarget: aarch64-apple-darwin
             runner: macos-latest
           - key: darwin-x64
-            packageName: cpd-darwin-x64
+            packageName: jscpd-darwin-x64
             os: darwin
             cpu: x64
             rustTarget: x86_64-apple-darwin
             runner: macos-latest
           - key: windows-x64-msvc
-            packageName: cpd-windows-x64-msvc
+            packageName: jscpd-windows-x64-msvc
             os: win32
             cpu: x64
             rustTarget: x86_64-pc-windows-msvc
             runner: windows-latest
+          - key: windows-arm64-msvc
+            packageName: jscpd-windows-arm64-msvc
+            os: win32
+            cpu: arm64
+            rustTarget: aarch64-pc-windows-msvc
+            runner: windows-11-arm
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check platform package already published (idempotency)
         id: platform-package
@@ -106,16 +121,51 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # On a resumed release (platform package already on npm from an earlier
+      # run), the build is skipped — but the release job attaches assets from
+      # THIS run's artifacts only. Repack the published npm binary as the
+      # release-asset tarball so resumed releases still get all assets.
+      - name: Repack published binary for release assets
+        if: steps.platform-package.outputs.published == 'true'
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          package_name="${{ matrix.target.packageName }}"
+          mkdir -p rust/target/release-assets repack
+          npm pack "${package_name}@${version}" --pack-destination repack >/dev/null
+          tar -xzf repack/*.tgz -C repack
+          binary_name="jscpd"
+          if [ "${{ matrix.target.os }}" = "win32" ]; then
+            binary_name="jscpd.exe"
+          fi
+          bin_path=$(find repack/package -name "$binary_name" -type f | head -1)
+          [ -n "$bin_path" ] || { echo "::error::${binary_name} not found in ${package_name}@${version}"; exit 1; }
+          # Binary and LICENSE at the archive root (cargo-binstall's bin-dir
+          # in rust/crates/cpd/Cargo.toml relies on that layout).
+          mkdir -p repack/stage
+          cp "$bin_path" repack/stage/
+          cp LICENSE repack/stage/LICENSE
+          chmod +x "repack/stage/$binary_name"
+          tar -czf "rust/target/release-assets/jscpd-${{ matrix.target.key }}.tar.gz" \
+            -C repack/stage "$binary_name" LICENSE
+
+      - name: Upload binary artifact (from published package)
+        if: steps.platform-package.outputs.published == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jscpd-binary-${{ matrix.target.key }}
+          path: rust/target/release-assets/jscpd-${{ matrix.target.key }}.tar.gz
+          retention-days: 1
+
       - name: Install Rust toolchain
         if: steps.platform-package.outputs.published != 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
-          toolchain: "1.93"
+          toolchain: "1.97.1"
           targets: ${{ matrix.target.rustTarget }}
 
       - name: Cache Cargo registry and target
         if: steps.platform-package.outputs.published != 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: "rust -> rust/target"
           cache-on-failure: true
@@ -127,15 +177,20 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
+      # Native musl builds on both x64 and arm64 runners: musl-tools ships the
+      # host-architecture musl-gcc, and the Rust musl targets link
+      # self-contained, so no cross linker is needed.
       - name: Install musl tools
-        if: steps.platform-package.outputs.published != 'true' && matrix.target.key == 'linux-x64-musl'
+        if: steps.platform-package.outputs.published != 'true' && matrix.target.libc == 'musl'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
       - name: Install cargo-nextest
         if: steps.platform-package.outputs.published != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        with:
+          tool: nextest
 
       - name: Test
         # Skip for darwin-x64: cross-compiled from ARM Mac, tests cannot run on host
@@ -145,7 +200,7 @@ jobs:
 
       - name: Upload test results
         if: always() && steps.platform-package.outputs.published != 'true' && matrix.target.key != 'darwin-x64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nextest-results-${{ matrix.target.key }}
           path: rust/target/nextest/ci/nextest.xml
@@ -153,7 +208,7 @@ jobs:
 
       - name: Test Report
         if: always() && steps.platform-package.outputs.published != 'true' && matrix.target.key != 'darwin-x64'
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
         with:
           name: Rust Tests (${{ matrix.target.key }})
           path: rust/target/nextest/ci/nextest.xml
@@ -183,7 +238,17 @@ jobs:
         working-directory: rust
         run: |
           version="${{ needs.version.outputs.version }}"
-          binary="./target/${{ matrix.target.rustTarget }}/release/cpd"
+          binary="./target/${{ matrix.target.rustTarget }}/release/jscpd"
+          BUILT_VERSION=$("$binary" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "NOT_FOUND")
+          echo "Built: ${BUILT_VERSION}, Expected: ${version}"
+          [ "$BUILT_VERSION" = "${version}" ] || { echo "Version mismatch!"; exit 1; }
+
+      - name: Smoke test (Windows)
+        if: steps.platform-package.outputs.published != 'true' && matrix.target.os == 'win32'
+        working-directory: rust
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          binary="./target/${{ matrix.target.rustTarget }}/release/jscpd.exe"
           BUILT_VERSION=$("$binary" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "NOT_FOUND")
           echo "Built: ${BUILT_VERSION}, Expected: ${version}"
           [ "$BUILT_VERSION" = "${version}" ] || { echo "Version mismatch!"; exit 1; }
@@ -192,30 +257,31 @@ jobs:
         if: steps.platform-package.outputs.published != 'true'
         working-directory: rust
         run: |
-          binary_name="cpd"
-          if [ "${{ matrix.target.os }}" = "win32" ]; then
-            binary_name="cpd.exe"
-          fi
           mkdir -p target/release-assets
-          tar -czf "target/release-assets/cpd-${{ matrix.target.key }}.tar.gz" \
-            -C "target/${{ matrix.target.rustTarget }}/release" \
-            "$binary_name"
+          binary_name="jscpd"
+          if [ "${{ matrix.target.os }}" = "win32" ]; then
+            binary_name="jscpd.exe"
+          fi
+          # Binary and LICENSE at the archive root (cargo-binstall's bin-dir
+          # in crates/cpd/Cargo.toml relies on that layout).
+          stage="target/release-assets/stage-${{ matrix.target.key }}"
+          rm -rf "$stage" && mkdir -p "$stage"
+          cp "target/${{ matrix.target.rustTarget }}/release/$binary_name" "$stage/"
+          cp ../LICENSE "$stage/LICENSE"
+          tar -czf "target/release-assets/jscpd-${{ matrix.target.key }}.tar.gz" \
+            -C "$stage" "$binary_name" LICENSE
 
       - name: Upload binary artifact
         if: steps.platform-package.outputs.published != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cpd-binary-${{ matrix.target.key }}
-          path: rust/target/release-assets/cpd-${{ matrix.target.key }}.tar.gz
+          name: jscpd-binary-${{ matrix.target.key }}
+          path: rust/target/release-assets/jscpd-${{ matrix.target.key }}.tar.gz
           retention-days: 1
-
-      - name: Install pnpm
-        if: steps.platform-package.outputs.published != 'true'
-        uses: pnpm/action-setup@v4
 
       - name: Install Node
         if: steps.platform-package.outputs.published != 'true'
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -244,15 +310,15 @@ jobs:
     if: ${{ always() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm publish --provenance
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -299,22 +365,39 @@ jobs:
       - publish-main
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # npm publish --provenance
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install cpd globally for fixture check
         working-directory: rust
         run: |
-          npm install -g cpd@${{ needs.version.outputs.version }}
+          version="${{ needs.version.outputs.version }}"
+          # ponytail: npm registry CDN propagates with eventual consistency;
+          # a freshly published cpd@${version} may 404 for seconds-to-minutes.
+          # Poll npm view before installing. Switch to a registry webhook if
+          # propagation latency ever exceeds ~5 minutes regularly.
+          for i in $(seq 1 30); do
+            if npm view "cpd@${version}" version >/dev/null 2>&1; then
+              npm install -g "cpd@${version}"
+              exit 0
+            fi
+            echo "Attempt $i/30: waiting for cpd@${version} to propagate on npm..."
+            sleep 10
+          done
+          echo "::error::cpd@${version} never became installable on npm after ~5 minutes"
+          exit 1
 
       - name: Fixture check
         working-directory: rust
         run: |
-          cpd ../fixtures --silent --reporters json || true
+          jscpd ../fixtures --silent --reporters json || true
 
       - name: Setup Node.js for publish
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"

@@ -5,7 +5,7 @@ description: Copy-paste detector for 220+ languages. Detect duplicated code and 
 
 # jscpd
 
-Copy-paste detector for programming source code, supports 150+ languages. Use this skill to run jscpd and understand its output.
+Copy-paste detector for programming source code, supports 220+ languages. Use this skill to run jscpd and understand its output.
 
 ## Quick Start
 
@@ -46,18 +46,74 @@ Each line represents one clone pair:
 | `--reporters json` | Output JSON report |
 | `--min-tokens N` | Minimum tokens to consider a duplication (default: 50) |
 | `--min-lines N` | Minimum lines to consider a duplication (default: 5) |
-| `--min-similarity N` | Minimum similarity percentage (default: 100, range: 1-100) |
 | `--threshold N` | Exit with error if duplication % exceeds N |
 | `--ignore "glob"` | Ignore patterns (comma-separated) |
 | `--format "list"` | Limit to specific languages (e.g. `typescript,javascript`) |
+| `--cross-formats "groups"` | Detect clones across related formats (e.g. `javascript,typescript` or the `js-ts` preset) |
+| `--summary` | Append a codebase summary: top files/folders by tokens, lines, size, complexity, with duplication share |
+| `--summary-top N` | Number of entries in each summary top list (default: 10) |
+| `--summary-by metric` | Summary ranking metric: `tokens`, `lines`, `size`, `complexity` (default: `tokens`) |
 | `--pattern "glob"` | Glob pattern to select files |
-| `--gitignore` | Respect .gitignore |
+| `--no-gitignore` | Do not respect `.gitignore` (it is respected by default) |
 | `--output "path"` | Directory to write reports to |
-| `--silent` | Suppress output (useful with `--output` only) |
-| `--list-output` | Print clone list to stdout (alternative to ai reporter) |
-| `--store-path "path"` | Directory for LevelDB cache |
+| `--silent` | Suppress console output (useful with file reporters and `--output`) |
+| `--list` | List all supported formats and exit |
 | `--no-tips` | Disable tips in output (enabled by default in CI) |
 | `--config "path"` | Path to .jscpd.json config file |
+
+## Codebase Summary (`--summary`)
+
+`--summary` appends a refactoring-hotspot overview to the run output — use it to decide **where to refactor first** before diving into individual clones:
+
+```bash
+# Compact clone list + compact summary, optimized for agents
+npx jscpd --reporters ai --summary --no-tips <path>
+
+# Rank by complexity instead of tokens, top 5 lists
+npx jscpd --reporters ai --summary --summary-by complexity --summary-top 5 <path>
+```
+
+With the `ai` reporter the summary is one line per entry:
+
+```
+Summary by tokens (321 files, 129 folders):
+files (tokens/lines/size/cx/dup%):
+src/files.ts 2052/363/11662/80/0.0%
+...
+folders (files/tokens/lines/size):
+src/core 8/5264/843/27136
+...
+```
+
+How to read it:
+- **Top files** are ranked by the `--summary-by` metric, but every row carries all metrics — `tokens/lines/size/cx/dup%`.
+- **cx** is a language-agnostic cyclomatic-complexity estimate from the token stream (1 + decision-point tokens like `if`/`while`/`&&`); treat it as a ranking signal, not an exact metric.
+- **dup%** is the share of the file's lines covered by detected clones — a large file with high `dup%` is the best refactoring target.
+- **Folders** aggregate files into their direct parent directory (no cumulative ancestor totals).
+- In `console` reporters the summary renders as aligned tables; in the `json` report it appears as an additive `summary` key (absent when the flag is off).
+
+Config file equivalents: `"summary": true`, `"summaryTop": 10`, `"summaryBy": "tokens"`.
+
+## Cross-Format Clone Detection
+
+By default each format is compared only against itself. `--cross-formats` defines groups of related formats that share one comparison pool, so a block duplicated between a `.js` and a `.ts` file is reported as a clone:
+
+```bash
+# One group: compare JavaScript and TypeScript files together
+npx jscpd --reporters ai --cross-formats "javascript,typescript" <path>
+
+# Preset covering javascript, jsx, typescript, tsx
+npx jscpd --reporters ai --cross-formats "js-ts" <path>
+
+# Multiple groups are separated by ";"
+npx jscpd --reporters ai --cross-formats "javascript,typescript;css,scss" <path>
+```
+
+Notes:
+- When a group mixes TypeScript with JavaScript, TS files are compared with erasable type syntax stripped, so `function f(a: number): void` matches `function f(a)`. Reported positions still reference the original source.
+- Groups need at least two formats; groups sharing a format are merged into one pool.
+- In per-format statistics, a cross-format clone is attributed to one member format of the group.
+- In config files the key is `crossFormats` (or `cross-formats`) and accepts a string (`"javascript,typescript;css,scss"`), an array of strings (`["javascript,typescript", "css,scss"]`), or an array of arrays (`[["javascript","typescript"],["css","scss"]]`).
 
 ## Configuration File
 

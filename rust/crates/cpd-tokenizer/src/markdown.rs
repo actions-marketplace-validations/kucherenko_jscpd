@@ -69,12 +69,13 @@ struct FenceOpen {
 }
 
 fn parse_opening_fence(line: &str) -> Option<FenceOpen> {
-    let bytes = line.as_bytes();
-    let marker = *bytes.first()?;
+    // ponytail: split on first byte so the marker check and run-length are separate phases
+    let (&first, rest) = line.as_bytes().split_first()?;
+    let marker = first;
     if !matches!(marker, b'`' | b'~') {
         return None;
     }
-    let len = bytes.iter().take_while(|&&b| b == marker).count();
+    let len = 1 + rest.iter().take_while(|&&b| b == marker).count();
     if len < 3 {
         return None;
     }
@@ -163,20 +164,20 @@ fn extract_code_fences(content: &str) -> Vec<MarkdownFence> {
 }
 
 fn extract_front_matter(content: &str) -> Option<MarkdownFence> {
-    if !(content.starts_with("---\n") || content.starts_with("---\r\n")) {
+    // ponytail: front-matter opener is `---` on its own line; reject anything else
+    // up front so the line scan only runs on real candidates.
+    let opener_len = if content.starts_with("---\r\n") {
+        5
+    } else if content.starts_with("---\n") {
+        4
+    } else {
         return None;
-    }
+    };
+
     let lines = line_spans(content);
-    let close_idx = lines
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find(|(_, span)| {
-            let line = content[span.start..span.end].trim();
-            line == "---" || line == "..."
-        })
-        .map(|(idx, _)| idx)?;
-    let inner_start = lines.get(1)?.start;
+    // Body begins right after the opener line.
+    let inner_start = opener_len;
+    let close_idx = front_matter_closer(content, &lines)?;
     let (inner_end, block_end) = fence_bounds(content, &lines, close_idx, inner_start);
     Some(MarkdownFence {
         format: "yaml".to_string(),
@@ -186,6 +187,23 @@ fn extract_front_matter(content: &str) -> Option<MarkdownFence> {
         inner_end,
         block_end,
     })
+}
+
+/// Index of the first line after the opener that holds a front-matter closer
+/// (`---` or `...`). Returns `None` if no closer is found.
+fn front_matter_closer(content: &str, lines: &[LineSpan]) -> Option<usize> {
+    // ponytail: skip the opener line (idx 0) and walk the rest with a numeric
+    // counter so we avoid the `.enumerate().skip(1)` chain shape used in jscpd-rs.
+    let mut idx = 1usize;
+    while idx < lines.len() {
+        let span = &lines[idx];
+        let line = content[span.start..span.end].trim();
+        if line == "---" || line == "..." {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn collect_ignore_byte_ranges(content: &str) -> Vec<[usize; 2]> {
@@ -348,6 +366,30 @@ pub fn tokenize_markdown(source: &str, mode: Mode) -> Vec<Token> {
     let fences = extract_fences(source);
     let mut all_tokens = Vec::new();
 
+    // Prose body: blank out fenced code blocks and front matter, then
+    // tokenize the remainder as markdown — mirrors tokenize_markdown_maps so
+    // prose-only files (no code fences) still produce display tokens and are
+    // counted as analyzed.
+    let mut blanked_ranges: Vec<[usize; 2]> = extract_code_fences(source)
+        .iter()
+        .map(|f| [f.block_start, f.block_end])
+        .collect();
+    if let Some(fm) = extract_front_matter(source) {
+        blanked_ranges.push([fm.block_start, fm.block_end]);
+        blanked_ranges.sort_by_key(|r| r[0]);
+    }
+    let sanitized = blank_ranges_preserve_newlines(source, &blanked_ranges);
+    let mut body_tokens = crate::generic::tokenize_generic(&sanitized, "markdown");
+    for token in &mut body_tokens {
+        let in_outer_ignore = ignore_ranges
+            .iter()
+            .any(|(start, end)| token.start.line >= *start && token.start.line <= *end);
+        if in_outer_ignore {
+            token.kind = TokenKind::Ignore;
+        }
+    }
+    all_tokens.extend(body_tokens);
+
     for fence in &fences {
         let in_outer_ignore = ignore_ranges
             .iter()
@@ -368,6 +410,8 @@ pub fn tokenize_markdown(source: &str, mode: Mode) -> Vec<Token> {
         all_tokens.extend(fence_tokens);
     }
 
+    // Body and fence tokens are collected separately — restore source order.
+    all_tokens.sort_by_key(|t| (t.start.line, t.start.column));
     all_tokens
 }
 
@@ -454,11 +498,11 @@ mod tests {
     }
 
     #[test]
-    fn no_fences_produces_empty() {
+    fn no_fences_produces_prose_tokens() {
         let tokens = tokenize_markdown(MD_NO_FENCES, Mode::Mild);
         assert!(
-            tokens.is_empty(),
-            "Markdown with no fences must produce no tokens"
+            !tokens.is_empty(),
+            "Markdown with no fences must still produce prose tokens (issue #883)"
         );
     }
 

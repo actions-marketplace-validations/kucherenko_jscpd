@@ -57,9 +57,142 @@ pub fn parse_format_mappings(input: &str) -> HashMap<String, Vec<String>> {
     result
 }
 
+/// Named shortcuts for common cross-format groups.
+pub const CROSS_FORMAT_PRESETS: &[(&str, &[&str])] =
+    &[("js-ts", &["javascript", "jsx", "typescript", "tsx"])];
+
+/// Parse a `--cross-formats` value: semicolon-separated groups of
+/// comma-separated format names, e.g. "javascript,typescript;css,scss".
+/// Preset names (see [`CROSS_FORMAT_PRESETS`]) expand in place. Groups that
+/// end up with fewer than two formats are dropped; groups sharing a format
+/// are merged (union).
+pub fn parse_cross_formats(input: &str) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for group in input.split(';') {
+        let mut formats: Vec<String> = Vec::new();
+        for entry in group.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let expanded = CROSS_FORMAT_PRESETS
+                .iter()
+                .find(|(name, _)| *name == entry)
+                .map(|(_, members)| members.iter().map(|m| m.to_string()).collect())
+                .unwrap_or_else(|| vec![entry.to_string()]);
+            for format in expanded {
+                if !formats.contains(&format) {
+                    formats.push(format);
+                }
+            }
+        }
+        if formats.len() < 2 {
+            if !formats.is_empty() {
+                eprintln!(
+                    "Warning: --cross-formats group '{}' has fewer than two formats, ignored",
+                    group.trim()
+                );
+            }
+            continue;
+        }
+        groups.push(formats);
+    }
+
+    // Merge groups that share a format (union semantics): a format can only
+    // belong to one detection pool.
+    let mut merged: Vec<Vec<String>> = Vec::new();
+    for group in groups {
+        let mut group = group;
+        loop {
+            let overlap = merged
+                .iter()
+                .position(|m| m.iter().any(|f| group.contains(f)));
+            match overlap {
+                Some(idx) => {
+                    let existing = merged.remove(idx);
+                    eprintln!(
+                        "Warning: --cross-formats groups '{}' and '{}' overlap, merged",
+                        existing.join(","),
+                        group.join(",")
+                    );
+                    for format in existing.into_iter().rev() {
+                        if !group.contains(&format) {
+                            group.insert(0, format);
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        merged.push(group);
+    }
+    merged
+}
+
+/// Parse a `--skip-isolated` value: comma-separated isolation groups of
+/// pipe-separated folders, e.g. "packages/a|packages/b,libs/a|libs/b".
+/// Matches the CLI syntax of jscpd PR #628. Groups that end up with fewer
+/// than two folders can never isolate anything and are dropped with a warning.
+pub fn parse_skip_isolated(input: &str) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for group in input.split(',') {
+        let folders: Vec<String> = group
+            .split('|')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect();
+        if folders.len() < 2 {
+            if !folders.is_empty() {
+                eprintln!(
+                    "Warning: --skip-isolated group '{}' has fewer than two folders, ignored",
+                    group.trim()
+                );
+            }
+            continue;
+        }
+        groups.push(folders);
+    }
+    groups
+}
+
+/// Name the program was invoked as (`cpd` or `jscpd`).
+///
+/// Both bin targets are built from the same `main.rs`, so the name cannot be
+/// a literal: it is taken from the file stem of argv[0] (`jscpd.exe` → `jscpd`),
+/// falling back to the bin target name baked in at compile time when argv[0]
+/// is unavailable or empty. clap wants a `&'static str` for the command name,
+/// so the (single, process-lifetime) string is leaked.
+pub fn invoked_name() -> &'static str {
+    std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            Path::new(&arg0)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .map_or(env!("CARGO_BIN_NAME"), |name| {
+            Box::leak(name.into_boxed_str())
+        })
+}
+
+impl Cli {
+    /// Parse `std::env::args_os()` with the command named after the invoked
+    /// binary, so `--version` and the `Usage:` line say `jscpd` when run as
+    /// `jscpd` and `cpd` when run as `cpd`. Exits like `Cli::parse()` on
+    /// error, `--help` and `--version`.
+    pub fn parse_invoked() -> Self {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let matches = Cli::command().name(invoked_name()).get_matches();
+        Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "cpd",
+    name = env!("CARGO_BIN_NAME"),
     about = "Copy/Paste Detector — find duplicated code",
     version
 )]
@@ -100,8 +233,8 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub ignore_pattern: Vec<String>,
 
-    /// Output reporters (comma-separated): console,json,xml,csv,html,markdown,badge,sarif,ai,xcode,threshold,silent,console-full
-    /// Aliases: "full" and "consoleFull" are accepted for "console-full"
+    /// Output reporters (comma-separated): console,json,xml,csv,html,markdown,badge,sarif,codeclimate,openmetrics,ai,xcode,threshold,silent,console-full
+    /// Aliases: "full" and "consoleFull" are accepted for "console-full"; "gitlab" for "codeclimate"
     #[arg(long, short = 'r', value_delimiter = ',')]
     pub reporters: Vec<String>,
 
@@ -120,6 +253,31 @@ pub struct Cli {
     /// Maximum duplication percentage before exit 1
     #[arg(long, short = 't')]
     pub threshold: Option<f64>,
+
+    /// Report SARIF results as "error" for clones with at least this many tokens (default: all "warning")
+    #[arg(long, value_name = "TOKENS")]
+    pub sarif_error_tokens: Option<u32>,
+
+    /// Path to a clone baseline file (e.g. .jscpd-baseline.json): clones whose
+    /// fingerprint is absent from it are reported as new
+    #[arg(long, value_name = "FILE")]
+    pub baseline: Option<PathBuf>,
+
+    /// Rewrite the baseline file from the current run, creating it if missing,
+    /// and print added/removed fingerprint counts (requires --baseline)
+    #[arg(long)]
+    pub update_baseline: bool,
+
+    /// Exit 1 when more than N new clones are found (default N: 0; requires
+    /// --baseline or --baseline-from-ref)
+    #[arg(long, value_name = "N", num_args(0..=1), default_missing_value = "0")]
+    pub fail_on_new_clones: Option<u64>,
+
+    /// Compare against an ephemeral baseline built from a git ref's tree
+    /// (e.g. origin/main): the base ref is scanned with the same
+    /// configuration and clones absent from it are reported as new
+    #[arg(long, value_name = "REF", conflicts_with_all = ["baseline", "update_baseline"])]
+    pub baseline_from_ref: Option<String>,
 
     /// Enrich clones with git blame data
     #[arg(long, short = 'b')]
@@ -161,6 +319,14 @@ pub struct Cli {
     #[arg(long)]
     pub formats_names: Option<String>,
 
+    /// Detect clones across formats: semicolon-separated groups of
+    /// comma-separated formats (e.g. "javascript,typescript;css,scss").
+    /// Preset: js-ts = javascript,jsx,typescript,tsx. TypeScript files in a
+    /// group that also contains JavaScript are compared with type
+    /// annotations stripped.
+    #[arg(long)]
+    pub cross_formats: Option<String>,
+
     /// Accepted for compatibility; external store backend not supported in V1
     #[arg(long, hide = true)]
     pub store: Option<String>,
@@ -181,9 +347,32 @@ pub struct Cli {
     #[arg(long, visible_alias = "skipLocal")]
     pub skip_local: bool,
 
+    /// Skip clones between different folders of the same isolation group:
+    /// comma-separated groups of pipe-separated folders
+    /// (e.g. "packages/a|packages/b,libs/a|libs/b")
+    #[arg(long, visible_alias = "skipIsolated", value_name = "GROUPS")]
+    pub skip_isolated: Option<String>,
+
     /// Minimum percentage of duplication to report (0-100)
     #[arg(long, default_value = "0")]
     pub min_duplicated_lines: f64,
+
+    /// Serve the Model Context Protocol over stdio: scan PATHs once, then expose
+    /// check_duplication / get_statistics / check_current_directory tools to MCP clients
+    #[arg(long)]
+    pub mcp: bool,
+
+    /// Print a codebase summary: top files and folders by tokens, lines, size, complexity
+    #[arg(long)]
+    pub summary: bool,
+
+    /// Number of entries in each summary top list (default: 10)
+    #[arg(long, value_name = "N")]
+    pub summary_top: Option<usize>,
+
+    /// Summary sort metric: tokens, lines, size, complexity (default: tokens)
+    #[arg(long, value_name = "METRIC")]
+    pub summary_by: Option<String>,
 
     /// Do not write detection progress and result to console
     #[arg(long, short = 's')]
@@ -219,6 +408,13 @@ pub struct ConfigFile {
     pub reporters: Option<Vec<String>>,
     pub output: Option<String>,
     pub threshold: Option<f64>,
+    #[serde(alias = "sarif-error-tokens")]
+    pub sarif_error_tokens: Option<u32>,
+    pub baseline: Option<String>,
+    #[serde(alias = "fail-on-new-clones")]
+    pub fail_on_new_clones: Option<u64>,
+    #[serde(alias = "baseline-from-ref")]
+    pub baseline_from_ref: Option<String>,
     pub blame: Option<bool>,
     #[serde(alias = "no-gitignore")]
     pub no_gitignore: Option<bool>,
@@ -235,19 +431,31 @@ pub struct ConfigFile {
     pub formats_exts: Option<String>,
     #[serde(alias = "formats-names")]
     pub formats_names: Option<String>,
+    #[serde(alias = "cross-formats")]
+    pub cross_formats: Option<String>,
     #[serde(alias = "skip-local")]
     pub skip_local: Option<bool>,
+    /// Isolation groups as nested arrays (matching the jscpd `skipIsolated`
+    /// config shape): `[["packages/a", "packages/b"], ["libs/a", "libs/b"]]`.
+    #[serde(alias = "skip-isolated")]
+    pub skip_isolated: Option<Vec<Vec<String>>>,
     #[serde(alias = "exit-code")]
     pub exit_code: Option<i32>,
     #[serde(alias = "no-tips")]
     pub no_tips: Option<bool>,
     pub silent: Option<bool>,
+    pub summary: Option<bool>,
+    #[serde(alias = "summary-top")]
+    pub summary_top: Option<usize>,
+    #[serde(alias = "summary-by")]
+    pub summary_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ConfigSource {
     Explicit(PathBuf),
     AutoJscpdJson,
+    AutoDotConfig(PathBuf),
     AutoPackageJson,
 }
 
@@ -406,6 +614,10 @@ pub(crate) static KNOWN_CONFIG_FIELDS: &[&str] = &[
     "reporters",
     "output",
     "threshold",
+    "sarifErrorTokens",
+    "baseline",
+    "failOnNewClones",
+    "baselineFromRef",
     "blame",
     "noGitignore",
     "followSymlinks",
@@ -417,7 +629,9 @@ pub(crate) static KNOWN_CONFIG_FIELDS: &[&str] = &[
     "ignoreCase",
     "formatsExts",
     "formatsNames",
+    "crossFormats",
     "skipLocal",
+    "skipIsolated",
     "exitCode",
     "noTips",
     "silent",
@@ -430,12 +644,17 @@ pub(crate) static KNOWN_CONFIG_FIELDS: &[&str] = &[
     "no-gitignore",
     "follow-symlinks",
     "skip-local",
+    "skip-isolated",
     "exit-code",
     "no-colors",
     "no-tips",
     "formats-exts",
     "formats-names",
+    "cross-formats",
     "ignore-pattern",
+    "sarif-error-tokens",
+    "fail-on-new-clones",
+    "baseline-from-ref",
 ];
 
 pub(crate) static V4_SILENT_IGNORE: &[&str] = &[
@@ -575,6 +794,44 @@ fn normalize_v4_config(value: &mut serde_json::Value) {
     for key in &["formatsNames", "formats-names"] {
         coerce_formats_mapping(obj, key);
     }
+    // "crossFormats" / "cross-formats" type coercion: accept array forms,
+    // convert to the canonical "a,b;c,d" string.
+    for key in &["crossFormats", "cross-formats"] {
+        coerce_cross_formats(obj, key);
+    }
+}
+
+/// Coerce a crossFormats field from array forms to the canonical string.
+///
+/// Accepted forms:
+///   - String: "javascript,typescript;css,scss" (canonical, no conversion)
+///   - Array of strings: ["javascript,typescript", "css,scss"] → joined with ";"
+///   - Array of arrays: [["javascript","typescript"],["css","scss"]] → inner
+///     joined with ",", outer with ";"
+fn coerce_cross_formats(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    if let Some(val) = obj.remove(key) {
+        let coerced = match val {
+            serde_json::Value::Array(arr) => {
+                let groups: Vec<String> = arr
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(s),
+                        serde_json::Value::Array(inner) => Some(
+                            inner
+                                .into_iter()
+                                .filter_map(|f| f.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                serde_json::Value::String(groups.join(";"))
+            }
+            other => other,
+        };
+        obj.insert(key.to_string(), coerced);
+    }
 }
 
 /// Coerce a formats mapping field (formatsExts/formatsNames) from array or object to string.
@@ -636,6 +893,12 @@ fn resolve_config_paths(cfg: &mut ConfigFile, config_dir: &Path) {
             })
             .collect();
     }
+    if let Some(ref mut baseline) = cfg.baseline {
+        let path = PathBuf::from(&*baseline);
+        if path.is_relative() {
+            *baseline = config_dir.join(path).to_string_lossy().to_string();
+        }
+    }
     if let Some(ref mut patterns) = cfg.ignore_pattern {
         *patterns = patterns
             .iter()
@@ -651,7 +914,8 @@ fn resolve_config_paths(cfg: &mut ConfigFile, config_dir: &Path) {
     }
 }
 
-/// Load config from file if specified, or from .jscpd.json / package.json jscpd key.
+/// Load config from file if specified, or from .jscpd.json / .config/jscpd.json /
+/// package.json jscpd key.
 /// Reports diagnostics for any errors encountered (IO, parse, unknown fields, invalid values).
 /// For explicit --config paths, all diagnostics are fatal (caller should exit with code 1).
 /// For auto-discovered configs, diagnostics are warnings and the cascade falls through
@@ -666,6 +930,10 @@ pub fn load_config(path: Option<&Path>) -> ConfigResult {
     let mut auto_diagnostics = Vec::new();
 
     if let Some(result) = try_load_jscpd_json(&mut auto_diagnostics) {
+        return result;
+    }
+
+    if let Some(result) = try_load_dot_config(&mut auto_diagnostics) {
         return result;
     }
 
@@ -756,6 +1024,24 @@ fn try_load_jscpd_json(auto_diagnostics: &mut Vec<ConfigDiagnostic>) -> Option<C
         ConfigSource::AutoJscpdJson,
         &path,
     ))
+}
+
+/// Optional dot-config convention (https://dot-config.github.io/): projects can
+/// keep tool configs in a .config/ subfolder instead of the repository root.
+/// Checked only after .jscpd.json, so a root config always wins.
+fn try_load_dot_config(auto_diagnostics: &mut Vec<ConfigDiagnostic>) -> Option<ConfigResult> {
+    for candidate in [".config/jscpd.json", ".config/.jscpd.json"] {
+        let path = PathBuf::from(candidate);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let value = parse_json_config(&content, &path, auto_diagnostics)?;
+            return Some(build_config_result(
+                value,
+                ConfigSource::AutoDotConfig(path.clone()),
+                &path,
+            ));
+        }
+    }
+    None
 }
 
 fn try_load_package_json(auto_diagnostics: &mut Vec<ConfigDiagnostic>) -> Option<ConfigResult> {
@@ -884,6 +1170,18 @@ mod tests {
     fn min_tokens_override() {
         let cli = Cli::parse_from(["cpd", "--min-tokens", "30", "."]);
         assert_eq!(cli.min_tokens, Some(30));
+    }
+
+    #[test]
+    fn sarif_error_tokens_default_is_none() {
+        let cli = Cli::parse_from(["cpd", "."]);
+        assert_eq!(cli.sarif_error_tokens, None);
+    }
+
+    #[test]
+    fn sarif_error_tokens_override() {
+        let cli = Cli::parse_from(["cpd", "--sarif-error-tokens", "200", "."]);
+        assert_eq!(cli.sarif_error_tokens, Some(200));
     }
 
     #[test]
@@ -1434,6 +1732,138 @@ mod tests {
     }
 
     #[test]
+    fn cross_formats_flag_parsing() {
+        let cli = Cli::parse_from(["cpd", "--cross-formats", "javascript,typescript", "."]);
+        assert_eq!(cli.cross_formats, Some("javascript,typescript".to_string()));
+    }
+
+    #[test]
+    fn parse_cross_formats_groups() {
+        assert_eq!(
+            parse_cross_formats("javascript, typescript ; css,scss"),
+            vec![
+                vec!["javascript".to_string(), "typescript".to_string()],
+                vec!["css".to_string(), "scss".to_string()],
+            ]
+        );
+        assert_eq!(parse_cross_formats(""), Vec::<Vec<String>>::new());
+        assert_eq!(parse_cross_formats(";;"), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn parse_cross_formats_preset() {
+        let expected_js_ts = vec![
+            "javascript".to_string(),
+            "jsx".to_string(),
+            "typescript".to_string(),
+            "tsx".to_string(),
+        ];
+        assert_eq!(parse_cross_formats("js-ts"), vec![expected_js_ts.clone()]);
+        assert_eq!(
+            parse_cross_formats("js-ts;css,scss"),
+            vec![
+                expected_js_ts.clone(),
+                vec!["css".to_string(), "scss".to_string()]
+            ]
+        );
+        // Preset inside a group merges with the extra format, deduped.
+        assert_eq!(
+            parse_cross_formats("js-ts,vue,typescript"),
+            vec![{
+                let mut g = expected_js_ts;
+                g.push("vue".to_string());
+                g
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_cross_formats_single_format_group_dropped() {
+        assert_eq!(
+            parse_cross_formats("javascript;css,scss"),
+            vec![vec!["css".to_string(), "scss".to_string()]]
+        );
+    }
+
+    #[test]
+    fn parse_cross_formats_overlapping_groups_merged() {
+        let groups = parse_cross_formats("javascript,typescript;typescript,tsx");
+        assert_eq!(groups.len(), 1, "overlapping groups must merge");
+        let merged = &groups[0];
+        for format in ["javascript", "typescript", "tsx"] {
+            assert!(merged.contains(&format.to_string()), "missing {format}");
+        }
+    }
+
+    #[test]
+    fn cross_formats_propagates_to_options() {
+        let cli = Cli::parse_from(["cpd", "--cross-formats", "javascript,typescript", "."]);
+        let config = ConfigFile::default();
+        let opts = crate::options::Options::from_cli_and_config(&cli, &config);
+        assert_eq!(
+            opts.cross_formats,
+            vec![vec!["javascript".to_string(), "typescript".to_string()]]
+        );
+    }
+
+    #[test]
+    fn cli_cross_formats_overrides_config() {
+        let config = ConfigFile {
+            cross_formats: Some("css,scss".to_string()),
+            ..Default::default()
+        };
+        let cli = Cli::parse_from(["cpd", "--cross-formats", "javascript,typescript", "."]);
+        let opts = crate::options::Options::from_cli_and_config(&cli, &config);
+        assert_eq!(
+            opts.cross_formats,
+            vec![vec!["javascript".to_string(), "typescript".to_string()]]
+        );
+    }
+
+    #[test]
+    fn cross_formats_from_config() {
+        assert_config_overrides_default(
+            |c| c.cross_formats = Some("javascript,typescript".to_string()),
+            |o| &o.cross_formats,
+            vec![vec!["javascript".to_string(), "typescript".to_string()]],
+            "config cross_formats should parse into groups",
+        );
+    }
+
+    #[test]
+    fn cross_formats_config_coercion_shapes() {
+        // string / array-of-strings / array-of-arrays all normalize to the
+        // canonical string before ConfigFile deserialization.
+        let cases = [
+            serde_json::json!({"crossFormats": "javascript,typescript;css,scss"}),
+            serde_json::json!({"crossFormats": ["javascript,typescript", "css,scss"]}),
+            serde_json::json!({"crossFormats": [["javascript","typescript"],["css","scss"]]}),
+            serde_json::json!({"cross-formats": [["javascript","typescript"],["css","scss"]]}),
+        ];
+        for mut value in cases {
+            normalize_v4_config(&mut value);
+            let cfg: ConfigFile = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                cfg.cross_formats,
+                Some("javascript,typescript;css,scss".to_string()),
+                "shape {value} must coerce to canonical string"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_formats_is_known_config_field() {
+        for key in ["crossFormats", "cross-formats"] {
+            let value = serde_json::json!({key: "javascript,typescript"});
+            let diags = scan_unknown_fields(&value, Path::new(".jscpd.json"));
+            assert!(
+                diags.is_empty(),
+                "'{key}' must not be reported as unknown: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn max_size_human_readable_kb() {
         assert_eq!(parse_size("100kb"), Some(102400));
     }
@@ -1886,6 +2316,14 @@ mod tests {
     }
 
     #[test]
+    fn config_file_sarif_error_tokens_both_spellings() {
+        let v: ConfigFile = serde_json::from_str(r#"{"sarifErrorTokens": 150}"#).unwrap();
+        assert_eq!(v.sarif_error_tokens, Some(150));
+        let v: ConfigFile = serde_json::from_str(r#"{"sarif-error-tokens": 150}"#).unwrap();
+        assert_eq!(v.sarif_error_tokens, Some(150));
+    }
+
+    #[test]
     fn config_file_kebab_case_ignore_case() {
         let v: ConfigFile = serde_json::from_str(r#"{"ignore-case": true}"#).unwrap();
         assert_eq!(v.ignore_case, Some(true));
@@ -1907,6 +2345,43 @@ mod tests {
     fn config_file_kebab_case_skip_local() {
         let v: ConfigFile = serde_json::from_str(r#"{"skip-local": true}"#).unwrap();
         assert_eq!(v.skip_local, Some(true));
+    }
+
+    #[test]
+    fn config_file_skip_isolated_nested_arrays() {
+        let v: ConfigFile =
+            serde_json::from_str(r#"{"skipIsolated": [["packages/a", "packages/b"]]}"#).unwrap();
+        assert_eq!(
+            v.skip_isolated,
+            Some(vec![vec![
+                "packages/a".to_string(),
+                "packages/b".to_string()
+            ]])
+        );
+        let v: ConfigFile =
+            serde_json::from_str(r#"{"skip-isolated": [["libs/a", "libs/b"]]}"#).unwrap();
+        assert_eq!(
+            v.skip_isolated,
+            Some(vec![vec!["libs/a".to_string(), "libs/b".to_string()]])
+        );
+    }
+
+    #[test]
+    fn parse_skip_isolated_groups() {
+        assert_eq!(
+            parse_skip_isolated("packages/a|packages/b, libs/a | libs/b"),
+            vec![
+                vec!["packages/a".to_string(), "packages/b".to_string()],
+                vec!["libs/a".to_string(), "libs/b".to_string()],
+            ]
+        );
+        assert_eq!(parse_skip_isolated(""), Vec::<Vec<String>>::new());
+        assert_eq!(parse_skip_isolated(",,"), Vec::<Vec<String>>::new());
+        // Single-folder groups can never isolate anything — dropped.
+        assert_eq!(
+            parse_skip_isolated("packages/a,libs/a|libs/b"),
+            vec![vec!["libs/a".to_string(), "libs/b".to_string()]]
+        );
     }
 
     #[test]
@@ -2064,6 +2539,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn normalize_noSymlinks_inverts_to_followSymlinks() {
         let mut value = serde_json::json!({"noSymlinks": true});
         normalize_v4_config(&mut value);
@@ -2075,6 +2551,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn normalize_noSymlinks_false_means_follow() {
         let mut value = serde_json::json!({"noSymlinks": false});
         normalize_v4_config(&mut value);
@@ -2083,6 +2560,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(non_snake_case)]
     fn normalize_noSymLinks_capital_l_inverts() {
         let mut value = serde_json::json!({"noSymLinks": true});
         normalize_v4_config(&mut value);

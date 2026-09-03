@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cpd_core::summary::SummaryMetric;
 use cpd_tokenizer::tokenizer::Mode;
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,11 @@ pub struct Options {
     pub output_dir: PathBuf,
     pub exit_code: Option<i32>,
     pub threshold: Option<f64>,
+    pub sarif_error_tokens: Option<u32>,
+    pub baseline: Option<PathBuf>,
+    pub update_baseline: bool,
+    pub fail_on_new_clones: Option<u64>,
+    pub baseline_from_ref: Option<String>,
     pub blame: bool,
     pub no_gitignore: bool,
     pub follow_symlinks: bool,
@@ -29,9 +35,14 @@ pub struct Options {
     pub ignore_case: bool,
     pub formats_exts: HashMap<String, Vec<String>>,
     pub formats_names: HashMap<String, Vec<String>>,
+    pub cross_formats: Vec<Vec<String>>,
     pub skip_local: bool,
+    pub skip_isolated: Vec<Vec<String>>,
     pub no_tips: bool,
     pub silent: bool,
+    pub summary: bool,
+    pub summary_top: usize,
+    pub summary_by: SummaryMetric,
     pub pattern: Option<String>,
     #[allow(dead_code)]
     pub list: bool,
@@ -69,6 +80,13 @@ impl Options {
             .as_deref()
             .or(config.formats_names.as_deref())
             .map(super::cli::parse_format_mappings)
+            .unwrap_or_default();
+
+        let cross_formats = cli
+            .cross_formats
+            .as_deref()
+            .or(config.cross_formats.as_deref())
+            .map(super::cli::parse_cross_formats)
             .unwrap_or_default();
 
         Self {
@@ -120,6 +138,17 @@ impl Options {
             }),
             exit_code: cli.exit_code.or(config.exit_code),
             threshold: cli.threshold.or(config.threshold),
+            sarif_error_tokens: cli.sarif_error_tokens.or(config.sarif_error_tokens),
+            baseline: cli
+                .baseline
+                .clone()
+                .or_else(|| config.baseline.clone().map(PathBuf::from)),
+            update_baseline: cli.update_baseline,
+            fail_on_new_clones: cli.fail_on_new_clones.or(config.fail_on_new_clones),
+            baseline_from_ref: cli
+                .baseline_from_ref
+                .clone()
+                .or(config.baseline_from_ref.clone()),
             blame: cli.blame || config.blame.unwrap_or(false),
             no_gitignore: cli.no_gitignore || config.no_gitignore.unwrap_or(false),
             follow_symlinks: cli.follow_symlinks || config.follow_symlinks.unwrap_or(false),
@@ -130,9 +159,25 @@ impl Options {
             ignore_case: cli.ignore_case || config.ignore_case.unwrap_or(false),
             formats_exts,
             formats_names,
+            cross_formats,
             skip_local: cli.skip_local || config.skip_local.unwrap_or(false),
+            skip_isolated: cli
+                .skip_isolated
+                .as_deref()
+                .map(super::cli::parse_skip_isolated)
+                .or_else(|| config.skip_isolated.clone())
+                .unwrap_or_default(),
             no_tips: cli.no_tips || config.no_tips.unwrap_or(false) || std::env::var("CI").is_ok(),
             silent: cli.silent || config.silent.unwrap_or(false),
+            summary: cli.summary || config.summary.unwrap_or(false),
+            summary_top: cli.summary_top.or(config.summary_top).unwrap_or(10),
+            // Invalid metric values are warned about in main() (like --mode).
+            summary_by: cli
+                .summary_by
+                .as_deref()
+                .or(config.summary_by.as_deref())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_default(),
             pattern: cli.pattern.clone().or(config.pattern.clone()),
             list: cli.list,
         }

@@ -241,13 +241,9 @@ fn print_row(cells: &[String; 7], widths: &[usize], header: bool, style: &Style,
     println!();
 }
 
-/// Strip a `:format` suffix from a source id so it can be used as a real path.
-pub fn clean_source_id(source_id: &str) -> &str {
-    match source_id.rfind(':') {
-        Some(pos) => &source_id[..pos],
-        None => source_id,
-    }
-}
+// Canonical implementations live in cpd-core so cpd-finder (blame) resolves
+// paths identically; re-exported here to keep the reporter-facing API stable.
+pub use cpd_core::paths::{clean_source_id, resolve_fragment_path};
 
 /// Read the text lines from `content` between `[start_line, end_line]` (1-indexed, inclusive).
 pub fn extract_lines(content: &str, start_line: u32, end_line: u32) -> String {
@@ -259,26 +255,45 @@ pub fn extract_lines(content: &str, start_line: u32, end_line: u32) -> String {
         .join("\n")
 }
 
-/// Load file contents once per source id. Returns the cached entry when available.
-pub fn read_file_cached<'a>(cache: &'a mut HashMap<String, String>, source_id: &str) -> &'a str {
-    let clean = clean_source_id(source_id);
-    let key = clean.to_string();
+/// Load file contents once per resolved path. Returns the cached entry when available.
+pub fn read_file_cached<'a>(
+    cache: &'a mut HashMap<String, String>,
+    fragment: &Fragment,
+) -> &'a str {
+    let resolved = resolve_fragment_path(fragment);
     cache
-        .entry(key)
-        .or_insert_with(|| std::fs::read_to_string(clean).unwrap_or_default())
+        .entry(resolved.clone())
+        .or_insert_with(|| std::fs::read_to_string(&resolved).unwrap_or_default())
         .as_str()
 }
 
 /// Read the source text for a fragment from disk, if available.
 pub fn fragment_text(cache: &mut HashMap<String, String>, fragment: &Fragment) -> String {
-    let content = read_file_cached(cache, &fragment.source_id).to_string();
+    let content = read_file_cached(cache, fragment).to_string();
     extract_lines(&content, fragment.start.line, fragment.end.line)
+}
+
+/// Content hash identifying a clone pair: the 16-hex-char `snippet_pair_hash`
+/// of both snippet texts, insensitive to fragment order. This is the same
+/// identity used by SARIF `partialFingerprints` and the baseline file. None
+/// when neither snippet can be read from disk.
+pub fn clone_pair_hash(cache: &mut HashMap<String, String>, clone: &CpdClone) -> Option<String> {
+    let snippet_a = fragment_text(cache, &clone.fragment_a);
+    let snippet_b = fragment_text(cache, &clone.fragment_b);
+    if snippet_a.is_empty() && snippet_b.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{:016x}",
+            cpd_core::hash::snippet_pair_hash(&snippet_a, &snippet_b)
+        ))
+    }
 }
 
 /// Print a source snippet for a fragment, with optional color dimming.
 pub fn print_snippet(fragment: &Fragment, style: &Style, max_display: usize) {
-    let clean_id = clean_source_id(&fragment.source_id);
-    let content = match std::fs::read_to_string(clean_id) {
+    let resolved = resolve_fragment_path(fragment);
+    let content = match std::fs::read_to_string(&resolved) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -325,9 +340,15 @@ pub fn format_location(
     )
 }
 
-/// Print a clone header line in console style: `Clone found (format)`.
-pub fn print_clone_header(style: &Style, format: &str) {
-    println!("{}", style.bold(&format!("Clone found ({})", format)));
+/// Print a clone header line in console style: `Clone found (format)`, with a
+/// ` [NEW]` marker for clones absent from the baseline.
+pub fn print_clone_header(style: &Style, format: &str, is_new: bool) {
+    let header = style.bold(&format!("Clone found ({})", format));
+    if is_new {
+        println!("{} {}", header, style.red("[NEW]"));
+    } else {
+        println!("{}", header);
+    }
 }
 
 /// Print the two fragment location lines for a clone (console-full style).
@@ -368,13 +389,18 @@ pub fn summary_line(
     )
 }
 
-/// Print the trailing "Found N clones" summary line.
-pub fn print_found_count(clones: &[CpdClone], style: &Style) {
-    if clones.is_empty() {
-        println!("{}", style.dim("Found 0 clones."));
+/// Print the trailing "Found N clones" summary line. When a baseline marked
+/// clones as new, the count is qualified with "(M new)".
+pub fn print_found_count(clones: &[CpdClone], new_clones: u64, style: &Style) {
+    let suffix = if new_clones > 0 {
+        format!(" ({} new)", new_clones)
     } else {
-        println!("{}", style.dim(&format!("Found {} clones.", clones.len())));
-    }
+        String::new()
+    };
+    println!(
+        "{}",
+        style.dim(&format!("Found {} clones{}.", clones.len(), suffix))
+    );
 }
 
 /// Print the report trailer shared by console-style reporters.
@@ -385,7 +411,7 @@ pub fn print_report_trailer(
     box_chars: BoxChars,
 ) {
     print_table(stats, style, box_chars);
-    print_found_count(clones, style);
+    print_found_count(clones, stats.total.new_clones, style);
 }
 
 /// Print the "No duplicates found." message used by console-style reporters.
@@ -504,14 +530,14 @@ pub mod fixtures {
     }
 
     pub fn tmp_dir(prefix: &str) -> PathBuf {
+        // A process-wide counter guarantees uniqueness across parallel test
+        // threads; timestamps alone can collide and make tests share a dir.
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "cpd-{}-{}-{}",
             prefix,
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
@@ -593,6 +619,7 @@ pub mod fixtures {
     ) -> CpdClone {
         let frag_a = Fragment {
             source_id: source_a.to_string(),
+            source_root: None,
             start: start.clone(),
             end: end.clone(),
             range: [0, 100],
@@ -600,6 +627,7 @@ pub mod fixtures {
         };
         let frag_b = Fragment {
             source_id: source_b.to_string(),
+            source_root: None,
             start,
             end,
             range: [0, 100],
@@ -610,6 +638,7 @@ pub mod fixtures {
             fragment_a: frag_a,
             fragment_b: frag_b,
             token_count,
+            is_new: false,
         }
     }
 }

@@ -1,25 +1,25 @@
 # cpd — Copy/Paste Detector
 
-Fast copy/paste detector for programming source code. Rust rewrite of [jscpd](https://github.com/kucherenko/jscpd), supports 223 language formats.
+Fast copy/paste detector for programming source code. Rust rewrite of [jscpd](https://github.com/kucherenko/jscpd), supports 224 language formats.
 
-> **jscpd v5.x** is the Rust-based implementation. For the TypeScript/Node.js version, see [jscpd v4.x](https://www.npmjs.com/package/jscpd/v/4).
+> **jscpd v5** is the Rust engine — a self-contained binary. The TypeScript engine (v4) is maintained on the [`master-v4`](https://github.com/kucherenko/jscpd/tree/master-v4) branch and published as `jscpd@4`.
 
 ## Packages
 
 | Package | Installs | When to use |
 |---------|----------|-------------|
-| `jscpd@5` | `jscpd` and `cpd` | Same binary, both command names available |
-| `cpd` | `cpd` | Shorter command name only |
+| [`jscpd`](https://www.npmjs.com/package/jscpd) | `jscpd` | Default install; the `jscpd` command |
+| [`cpd`](https://www.npmjs.com/package/cpd) | `cpd` | Shorter command name only |
 
-Both packages install the same Rust binary. Choose based on which command name you prefer.
+Both npm packages install the identical Rust binary. For both `jscpd` and `cpd` command names from a single install, use [crates.io](https://crates.io/crates/jscpd): `cargo install jscpd`.
 
 ## Install
 
 ```bash
-# installs both jscpd and cpd commands
+# npm — installs the jscpd command
 npm install -g jscpd
 
-# installs only the cpd command
+# npm — installs only the cpd command
 npm install -g cpd
 
 # crates.io — installs both jscpd and cpd binaries
@@ -35,7 +35,7 @@ nix profile install github:kucherenko/jscpd
 brew install jscpd
 ```
 
-Prebuilt binaries for 6 platforms — no Node.js runtime required.
+Prebuilt binaries for 8 platforms (macOS arm64/x64, Linux arm64/x64 with glibc or musl, Windows arm64/x64) — no Node.js runtime required.
 
 ## Quick Start
 
@@ -79,6 +79,7 @@ cpd --list
 | `--threshold` | `-t` | — | Max duplication % before exit 1 |
 | `--blame` | `-b` | — | Enrich clones with git blame data |
 | `--skip-local` | — | — | Skip clones within the same directory |
+| `--skip-isolated` | — | — | Skip clones between isolated monorepo folders (e.g. `packages/a\|packages/b`) |
 | `--silent` | `-s` | — | Suppress console output |
 | `--list` | — | — | List all supported formats and exit |
 
@@ -140,12 +141,12 @@ println!("Analyzed {} files", result.statistics.total.sources);
 ```
 cpd (CLI binary)
  ├── cpd-core      — Detection algorithm (Rabin-Karp rolling hash)
- ├── cpd-tokenizer — Language tokenization (223 formats)
+ ├── cpd-tokenizer — Language tokenization (224 formats)
  ├── cpd-finder    — File walking, orchestration, git blame
- └── cpd-reporter  — Output formatting (13 reporters)
+ └── cpd-reporter  — Output formatting (15 reporters)
 ```
 
-See [docs/rust.md](../../docs/rust.md) for detailed documentation, the full differences table from jscpd v4, and the Rust API.
+See [docs/rust.md](../../docs/rust.md) for detailed documentation and the v4 migration table, and [docs/api.md](../../docs/api.md) for the Rust API.
 
 
 ## License

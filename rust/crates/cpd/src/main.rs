@@ -1,8 +1,9 @@
+mod baseline_ref;
 mod cli;
+mod mcp;
 mod options;
 mod timer;
 
-use clap::Parser;
 use cli::{Cli, ConfigSource, load_config, print_diagnostics};
 use cpd_finder::orchestrate::{RunConfig, run};
 use cpd_reporter::context::ReportContext;
@@ -38,6 +39,10 @@ struct MergedConfig {
     output_dir: String,
     exit_code: Option<i32>,
     threshold: Option<f64>,
+    baseline: Option<String>,
+    update_baseline: bool,
+    fail_on_new_clones: Option<u64>,
+    baseline_from_ref: Option<String>,
     blame: bool,
     no_gitignore: bool,
     follow_symlinks: bool,
@@ -48,10 +53,15 @@ struct MergedConfig {
     ignore_case: bool,
     formats_exts: std::collections::HashMap<String, Vec<String>>,
     formats_names: std::collections::HashMap<String, Vec<String>>,
+    cross_formats: Vec<Vec<String>>,
     skip_local: bool,
+    skip_isolated: Vec<Vec<String>>,
     no_tips: bool,
     silent: bool,
     pattern: Option<String>,
+    summary: bool,
+    summary_top: usize,
+    summary_by: String,
 }
 
 impl MergedConfig {
@@ -73,6 +83,13 @@ impl MergedConfig {
             output_dir: opts.output_dir.to_string_lossy().to_string(),
             exit_code: opts.exit_code,
             threshold: opts.threshold,
+            baseline: opts
+                .baseline
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            update_baseline: opts.update_baseline,
+            fail_on_new_clones: opts.fail_on_new_clones,
+            baseline_from_ref: opts.baseline_from_ref.clone(),
             blame: opts.blame,
             no_gitignore: opts.no_gitignore,
             follow_symlinks: opts.follow_symlinks,
@@ -83,16 +100,21 @@ impl MergedConfig {
             ignore_case: opts.ignore_case,
             formats_exts: opts.formats_exts.clone(),
             formats_names: opts.formats_names.clone(),
+            cross_formats: opts.cross_formats.clone(),
             skip_local: opts.skip_local,
+            skip_isolated: opts.skip_isolated.clone(),
             no_tips: opts.no_tips,
             silent: opts.silent,
             pattern: opts.pattern.clone(),
+            summary: opts.summary,
+            summary_top: opts.summary_top,
+            summary_by: opts.summary_by.to_string(),
         }
     }
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = Cli::parse_invoked();
 
     // Handle --list flag: print all supported formats and exit 0
     if cli.list {
@@ -122,6 +144,9 @@ fn main() {
             }
             ConfigSource::AutoJscpdJson => {
                 eprintln!("Using config from .jscpd.json");
+            }
+            ConfigSource::AutoDotConfig(p) => {
+                eprintln!("Using config from {}", p.display());
             }
             ConfigSource::AutoPackageJson => {
                 eprintln!("Using config from package.json");
@@ -154,8 +179,43 @@ fn main() {
         }
     }
 
+    // CLI summary-by validation: warn on invalid value (parallels --mode)
+    if let Some(metric) = cli.summary_by.as_deref()
+        && let Err(e) = metric.parse::<cpd_core::summary::SummaryMetric>()
+    {
+        eprintln!("Warning: --summary-by: {} (defaulting to tokens)", e);
+    }
+
     let config = config_result.config;
     let opts = Options::from_cli_and_config(&cli, &config);
+
+    // Warn about unknown format names in --format: a typo like 'cs' would
+    // otherwise silently match 0 files and report a clean scan (#964).
+    // Custom formats introduced via --formats-exts are legal.
+    if !opts.formats.is_empty() {
+        let known = cpd_tokenizer::formats::list_formats();
+        for format in &opts.formats {
+            if !known.contains(&format.as_str()) && !opts.formats_exts.contains_key(format) {
+                eprintln!(
+                    "Warning: --format: '{}' is not a supported format, no files will match it (run with --list to see supported formats)",
+                    format
+                );
+            }
+        }
+    }
+
+    // Warn about unknown format names in --cross-formats. Custom formats
+    // introduced via --formats-exts are legal, so validate against both.
+    if !opts.cross_formats.is_empty() {
+        let known = cpd_tokenizer::formats::list_formats();
+        for group in &opts.cross_formats {
+            for format in group {
+                if !known.contains(&format.as_str()) && !opts.formats_exts.contains_key(format) {
+                    eprintln!("Warning: --cross-formats: unknown format '{}'", format);
+                }
+            }
+        }
+    }
 
     // Handle --debug: print merged config as JSON and exit
     if cli.debug {
@@ -165,6 +225,28 @@ fn main() {
             Err(e) => eprintln!("Error serializing config: {}", e),
         }
         std::process::exit(0);
+    }
+
+    // Baseline flag validation: the dependent flags are gates and must not
+    // silently no-op without a baseline source. Clap already rejects CLI-level
+    // combinations of --baseline-from-ref with --baseline/--update-baseline;
+    // this catches config-file/CLI mixes too.
+    if opts.baseline.is_some() && opts.baseline_from_ref.is_some() {
+        eprintln!("Error: use either --baseline or --baseline-from-ref, not both");
+        std::process::exit(1);
+    }
+    if opts.update_baseline && opts.baseline.is_none() {
+        eprintln!("Error: --update-baseline requires --baseline <file>");
+        std::process::exit(1);
+    }
+    if opts.fail_on_new_clones.is_some()
+        && opts.baseline.is_none()
+        && opts.baseline_from_ref.is_none()
+    {
+        eprintln!(
+            "Error: --fail-on-new-clones requires --baseline <file> or --baseline-from-ref <ref>"
+        );
+        std::process::exit(1);
     }
 
     // If no paths given, scan current directory
@@ -198,13 +280,26 @@ fn main() {
         no_gitignore: opts.no_gitignore,
         follow_symlinks: opts.follow_symlinks,
         skip_local: opts.skip_local,
+        skip_isolated: opts
+            .skip_isolated
+            .iter()
+            .map(|group| group.iter().map(std::path::PathBuf::from).collect())
+            .collect(),
         blame: opts.blame,
         workers: opts.workers,
         ignore_case: opts.ignore_case,
         formats_exts: opts.formats_exts.clone(),
         formats_names: opts.formats_names.clone(),
         pattern: opts.pattern.clone(),
+        cross_formats: opts.cross_formats.clone(),
     };
+
+    // --mcp: serve the Model Context Protocol over stdio instead of running a
+    // one-shot detection. stdout carries protocol messages only, so this must
+    // branch before any reporter output.
+    if cli.mcp {
+        std::process::exit(mcp::serve(run_config));
+    }
 
     // Start timing before detection
     let timer = Timer::start();
@@ -219,18 +314,75 @@ fn main() {
     };
 
     let mut clones = run_result.clones;
-    let statistics = run_result.statistics;
+    let mut statistics = run_result.statistics;
 
-    // Path normalization: by default, relativize source_ids to CWD for
-    // cleaner display.  With --absolute, ensure they stay absolute.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Path normalization: make source_ids scan-root-relative for display and
+    // SARIF output, while storing the scan root on Fragment.source_root so
+    // reporters can reconstruct the absolute path for file reading.
+    //
+    // Source IDs arrive canonicalized from the finder. We canonicalize scan
+    // roots here too for reliable prefix stripping (macOS /var → /private/var).
+    let canonical_roots: Vec<std::path::PathBuf> = paths
+        .iter()
+        .map(|p| {
+            let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if canonical.is_file() {
+                canonical
+                    .parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or(canonical)
+            } else {
+                canonical
+            }
+        })
+        .collect();
     for clone in &mut clones {
         if opts.absolute {
             make_path_absolute(&mut clone.fragment_a.source_id);
             make_path_absolute(&mut clone.fragment_b.source_id);
         } else {
-            relativize_if_subdir(&mut clone.fragment_a.source_id, &cwd);
-            relativize_if_subdir(&mut clone.fragment_b.source_id, &cwd);
+            relativize_to_scan_root(&mut clone.fragment_a, &canonical_roots);
+            relativize_to_scan_root(&mut clone.fragment_b, &canonical_roots);
+        }
+    }
+
+    // Baseline (issue #944): mark clones absent from the baseline as new and
+    // fill the newClones/newDuplicatedLines statistics before reporters run.
+    // Runs after path relativization so fingerprint file reads resolve.
+    if let Some(ref baseline_path) = opts.baseline {
+        match cpd_reporter::baseline::apply(
+            &mut clones,
+            &mut statistics,
+            baseline_path,
+            opts.update_baseline,
+        ) {
+            Ok(outcome) => {
+                if let Some(update) = outcome.update {
+                    eprintln!(
+                        "Baseline {} updated: {} fingerprints added, {} removed ({} total)",
+                        baseline_path.display(),
+                        update.added,
+                        update.removed,
+                        update.total
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(ref base_ref) = opts.baseline_from_ref {
+        // Stateless variant: scan the base ref's tree with the same
+        // configuration and compare against that ephemeral baseline.
+        match baseline_ref::baseline_from_ref(base_ref, &run_config) {
+            Ok(base) => {
+                cpd_reporter::baseline::apply_in_memory(&mut clones, &mut statistics, &base);
+            }
+            Err(msg) => {
+                eprintln!("Error: {}", msg);
+                std::process::exit(1);
+            }
         }
     }
 
@@ -248,6 +400,21 @@ fn main() {
     // Capture elapsed time (after blame so it's included)
     let elapsed = timer.elapsed();
 
+    // Opt-in codebase summary. Computed after detection from data already in
+    // memory; when --summary is off this is a no-op and detection output is
+    // byte-identical to previous releases.
+    let summary = if opts.summary {
+        Some(cpd_core::summary::compute_summary(
+            &run_result.sources,
+            &clones,
+            opts.summary_top,
+            opts.summary_by,
+            |id| display_source_path(id, opts.absolute, &canonical_roots),
+        ))
+    } else {
+        None
+    };
+
     // Reporter options
     let reporter_opts = ReporterOptions {
         output_dir: opts.output_dir.clone(),
@@ -256,6 +423,9 @@ fn main() {
         no_colors: opts.no_colors,
         blame_data,
         absolute: opts.absolute,
+        // Bundled at build time; matches what `cpd --version` prints (#915).
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        sarif_error_tokens: opts.sarif_error_tokens,
     };
 
     // --silent: remove console reporters, add silent, suppress time/tips
@@ -304,7 +474,7 @@ fn main() {
                     }
                 };
 
-            let ctx = ReportContext::new(&statistics, elapsed);
+            let ctx = ReportContext::new(&statistics, elapsed).with_summary(summary.as_ref());
             match reporter.report(&clones, &ctx, &opts.output_dir) {
                 Ok(()) => {}
                 Err(cpd_reporter::reporter::ReporterError::ThresholdExceeded {
@@ -368,51 +538,106 @@ fn main() {
     }
 
     // Exit code logic
-    if threshold_exceeded {
+    let new_clones_exceeded = match opts.fail_on_new_clones {
+        // --update-baseline absorbs the current state; gating a run that just
+        // accepted its clones would always fail on the pre-update state.
+        Some(max_new) if !opts.update_baseline && statistics.total.new_clones > max_new => {
+            eprintln!(
+                "ERROR: jscpd found {} new clones not in the baseline (allowed: {})",
+                statistics.total.new_clones, max_new
+            );
+            true
+        }
+        _ => false,
+    };
+    if threshold_exceeded || new_clones_exceeded {
         std::process::exit(1);
     }
-    if let Some(code) = opts.exit_code {
-        if !clones.is_empty() {
-            std::process::exit(code);
-        }
+    if let Some(code) = opts.exit_code
+        && !clones.is_empty()
+    {
+        std::process::exit(code);
     }
 }
 
 /// Convert a source_id path to absolute if it isn't already.
 fn make_path_absolute(source_id: &mut String) {
     let path = std::path::Path::new(source_id);
-    if !path.is_absolute() {
-        if let Ok(abs) = std::fs::canonicalize(path) {
-            *source_id = abs.to_string_lossy().into_owned();
-        }
+    if !path.is_absolute()
+        && let Ok(abs) = std::fs::canonicalize(path)
+    {
+        *source_id = abs.to_string_lossy().into_owned();
     }
 }
 
-/// If `source_id` starts with `cwd`, strip it to produce a relative path.
-/// Otherwise leave it unchanged (it may be on another mount or already relative).
-fn relativize_if_subdir(source_id: &mut String, cwd: &std::path::Path) {
-    let path = std::path::Path::new(source_id);
-    if let Ok(stripped) = path.strip_prefix(cwd) {
-        *source_id = stripped.to_string_lossy().into_owned();
+/// Display path for a summary entry: the same relativization applied to clone
+/// fragments in `relativize_to_scan_root`, so per-file duplication matching
+/// works on identical strings.
+fn display_source_path(id: &str, absolute: bool, canonical_roots: &[std::path::PathBuf]) -> String {
+    if absolute {
+        return id.to_string();
     }
+    let path = std::path::Path::new(id);
+    for root in canonical_roots {
+        if let Ok(stripped) = path.strip_prefix(root) {
+            return strip_dot_prefix(&stripped.to_string_lossy());
+        }
+    }
+    strip_dot_prefix(id)
+}
+
+/// Strip a leading `./` or `.\` component so paths are not dot-prefixed.
+fn strip_dot_prefix(s: &str) -> String {
+    let mut chars = s.chars();
+    if chars.next() == Some('.') {
+        match chars.next() {
+            Some('/') | Some('\\') => chars.as_str().to_string(),
+            _ => s.to_string(),
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+/// Relativize a canonicalized `source_id` to its scan root and store the root
+/// on the fragment so reporters can reconstruct the absolute path for file I/O.
+///
+/// The first matching canonical scan root is used. If no root matches, the
+/// source_id is left unchanged (absolute) and source_root is set to None.
+fn relativize_to_scan_root(
+    fragment: &mut cpd_core::models::Fragment,
+    canonical_roots: &[std::path::PathBuf],
+) {
+    let path = std::path::Path::new(&fragment.source_id);
+    for root in canonical_roots {
+        if let Ok(stripped) = path.strip_prefix(root) {
+            fragment.source_root = Some(root.to_string_lossy().into_owned());
+            fragment.source_id = strip_dot_prefix(&stripped.to_string_lossy());
+            return;
+        }
+    }
+    fragment.source_id = strip_dot_prefix(&fragment.source_id);
 }
 
 /// Walk up from path to find the nearest `.git` directory.
-fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+///
+/// Canonicalizes `start` first: walking up a relative path terminates at the
+/// empty path (e.g. parent of `pkg` is `""`), which both mis-reports a repo
+/// rooted at the CWD as `""` and breaks the callers that canonicalize the
+/// returned root.
+pub(crate) fn find_git_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     let mut current = if start.is_file() {
         start.parent()?.to_path_buf()
     } else {
-        start.to_path_buf()
+        start
     };
 
     loop {
         if current.join(".git").exists() {
             return Some(current);
         }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => return None,
-        }
+        current = current.parent()?.to_path_buf();
     }
 }
 
@@ -456,5 +681,75 @@ mod tests {
         assert!(is_console_reporter("silent"));
         assert!(!is_console_reporter("json"));
         assert!(!is_console_reporter("html"));
+    }
+
+    #[test]
+    fn strip_dot_prefix_unix() {
+        assert_eq!(strip_dot_prefix("./src/foo.rs"), "src/foo.rs");
+        assert_eq!(strip_dot_prefix("src/foo.rs"), "src/foo.rs");
+        assert_eq!(strip_dot_prefix(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn strip_dot_prefix_windows() {
+        assert_eq!(strip_dot_prefix(".\\src\\foo.rs"), "src\\foo.rs");
+        assert_eq!(strip_dot_prefix(".\\foo.rs"), "foo.rs");
+    }
+
+    fn make_fragment(source_id: &str) -> cpd_core::models::Fragment {
+        cpd_core::models::Fragment {
+            source_id: source_id.to_string(),
+            source_root: None,
+            start: cpd_core::models::Location {
+                line: 1,
+                column: 0,
+                offset: 0,
+            },
+            end: cpd_core::models::Location {
+                line: 1,
+                column: 0,
+                offset: 0,
+            },
+            range: [0, 0],
+            blame: None,
+        }
+    }
+
+    #[test]
+    fn relativize_strips_scan_root_prefix_and_sets_root() {
+        let mut frag = make_fragment("/project/frontend/src/foo.rs");
+        let roots = vec![std::path::PathBuf::from("/project/frontend")];
+        relativize_to_scan_root(&mut frag, &roots);
+        assert_eq!(frag.source_id, "src/foo.rs");
+        assert_eq!(frag.source_root.as_deref(), Some("/project/frontend"));
+    }
+
+    #[test]
+    fn relativize_keeps_absolute_when_outside_all_roots() {
+        let mut frag = make_fragment("/elsewhere/src/foo.rs");
+        let roots = vec![std::path::PathBuf::from("/project")];
+        relativize_to_scan_root(&mut frag, &roots);
+        assert_eq!(frag.source_id, "/elsewhere/src/foo.rs");
+        assert!(frag.source_root.is_none());
+    }
+
+    #[test]
+    fn relativize_uses_first_matching_root() {
+        let mut frag = make_fragment("/project/frontend/src/foo.rs");
+        let roots = vec![
+            std::path::PathBuf::from("/project"),
+            std::path::PathBuf::from("/project/frontend"),
+        ];
+        relativize_to_scan_root(&mut frag, &roots);
+        assert_eq!(frag.source_id, "frontend/src/foo.rs");
+        assert_eq!(frag.source_root.as_deref(), Some("/project"));
+    }
+
+    #[test]
+    fn relativize_strips_dot_prefix() {
+        let mut frag = make_fragment("./src/foo.rs");
+        let roots = vec![std::path::PathBuf::from("/project")];
+        relativize_to_scan_root(&mut frag, &roots);
+        assert_eq!(frag.source_id, "src/foo.rs");
     }
 }

@@ -32,7 +32,7 @@ impl Reporter for ConsoleReporter {
         report_console_style(clones, ctx.stats, &self.style, BoxChars::ascii(), |clone| {
             let fa = &clone.fragment_a;
             let lines = fa.end.line.saturating_sub(fa.start.line) + 1;
-            print_clone_header(&self.style, &clone.format);
+            print_clone_header(&self.style, &clone.format, clone.is_new);
             println!(
                 " - {} [{}:{} - {}:{}] ({} lines, {} tokens)",
                 self.style.bold_green(&fa.source_id),
@@ -55,6 +55,9 @@ impl Reporter for ConsoleReporter {
                 )
             );
         });
+        if let Some(summary) = ctx.summary {
+            crate::summary_render::print_summary(summary, &self.style);
+        }
         Ok(())
     }
 }
@@ -78,6 +81,7 @@ mod tests {
         let ctx = ReportContext {
             stats: &one_clone_stats(),
             duration: Duration::ZERO,
+            summary: None,
         };
         assert!(
             reporter

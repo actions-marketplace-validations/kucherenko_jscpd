@@ -3,25 +3,37 @@
 
 const path = require("path");
 const { spawnSync } = require("child_process");
-const { getPlatformKey, PLATFORM_MAP } = require("./platform-map");
+const {
+  getPlatformKey,
+  PLATFORM_MAP,
+  describeHost,
+  supportedPlatforms,
+} = require("./platform-map");
 
 const key = getPlatformKey();
 if (!key) {
   console.error(
-    `jscpd: Unsupported platform ${process.platform}/${process.arch}`
+    `jscpd: no prebuilt binary for this platform: ${describeHost()}`
+  );
+  console.error(
+    `jscpd: supported platforms: ${supportedPlatforms().join(", ")}`
+  );
+  console.error(
+    "jscpd: build from source instead with `cargo install jscpd` " +
+      "(https://github.com/kucherenko/jscpd/tree/master/rust)"
   );
   process.exit(1);
 }
 
 const entry = PLATFORM_MAP[key];
-const binaryName = process.platform === "win32" ? "cpd.exe" : "cpd";
+const binaryName = process.platform === "win32" ? "jscpd.exe" : "jscpd";
 
 let binaryPath;
 try {
   const pkgJson = require.resolve(`${entry.packageName}/package.json`, {
     paths: [path.resolve(__dirname, ".."), __dirname],
   });
-  binaryPath = path.join(path.dirname(pkgJson), "cpd-bin", binaryName);
+  binaryPath = path.join(path.dirname(pkgJson), "bin", binaryName);
 } catch {
   const localBuild = path.join(
     __dirname,
