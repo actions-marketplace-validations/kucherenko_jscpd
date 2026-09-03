@@ -108,9 +108,16 @@ The `jscpd` npm package is downloaded **10M+ times per month**, and [~5,000 repo
 
 **Bundled by analysis platforms:**
 
-- [GitHub Super Linter](https://github.com/super-linter/super-linter) — official GitHub linter aggregator, bundles jscpd as its copy/paste detector
+- [GitHub Super Linter](https://github.com/super-linter/super-linter) — official GitHub linter aggregator, bundles jscpd as its copy/paste detector and runs it by default; 15,500+ workflow files on GitHub reference Super Linter (as of Sep 2026)
 - [MegaLinter](https://github.com/oxsecurity/megalinter) — open-source linter aggregator for CI, ships jscpd in every flavor including `ci_light`
 - [Codacy](https://www.codacy.com/) — automated code analysis platform, jscpd powers the duplication engine
+
+**Explicitly enabled in Super Linter** (`VALIDATE_JSCPD: true`) **by dozens of public repositories, including:**
+
+- [A2A](https://github.com/a2aproject/A2A) — Google's Agent2Agent protocol (25k+ stars)
+- [RimSort](https://github.com/RimSort/RimSort) — mod manager for RimWorld (1.2k+ stars); also runs jscpd directly with its own `.jscpd.json`
+- [Contact Center AI samples](https://github.com/GoogleCloudPlatform/contact-center-ai-samples) — official Google Cloud samples, with a dedicated jscpd config
+- [Drifty](https://github.com/SaptarshiSarkar12/Drifty) — open-source download manager
 
 **Used in notable projects:**
 
