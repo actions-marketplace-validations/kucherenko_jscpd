@@ -2,16 +2,15 @@ use std::collections::BTreeMap;
 
 use cpd_core::models::{DetectionToken, Token};
 
-use crate::embedded::blank_ranges_preserve_newlines;
+use crate::embedded::{blank_ranges_preserve_newlines, html_only_maps, tokenize_blocks_shifted};
 use crate::line_index::LineIndex;
 use crate::markdown::{offset_detection_tokens, tokens_to_detection};
-use crate::tokenizer::{Mode, TokenMap, TokenizeOptions, tokenize_format_to_detection};
+use crate::tokenizer::{Mode, NameRules, TokenMap, TokenizeOptions, tokenize_block_to_detection};
 
 #[derive(Debug, Clone)]
 struct RazorBlock {
     content: String,
     start_offset: usize,
-    start_line: u32,
 }
 
 /// Extract Razor code blocks (@-expressions and C# code).
@@ -23,7 +22,6 @@ fn extract_razor_blocks(source: &str) -> Vec<RazorBlock> {
     let mut brace_depth = 0;
     let mut waiting_for_block_brace = false;
     let mut offset = 0usize;
-    let mut line = 1u32;
 
     while offset < source.len() {
         let ch = source[offset..]
@@ -31,11 +29,6 @@ fn extract_razor_blocks(source: &str) -> Vec<RazorBlock> {
             .next()
             .expect("offset must point to a valid UTF-8 boundary");
         let ch_len = ch.len_utf8();
-
-        // Track line numbers for accurate location reporting
-        if ch == '\n' {
-            line += 1;
-        }
 
         // Detect @ entry into code
         if !in_code && ch == '@' && offset + ch_len < source.len() {
@@ -77,7 +70,6 @@ fn extract_razor_blocks(source: &str) -> Vec<RazorBlock> {
                 current_block = Some(RazorBlock {
                     content: String::new(),
                     start_offset: offset,
-                    start_line: line,
                 });
                 in_code = true;
                 brace_depth = 0;
@@ -147,16 +139,7 @@ pub fn tokenize_razor_maps(source: &str, options: &TokenizeOptions) -> Vec<Token
 
     if blocks.is_empty() {
         // Pure HTML, no code blocks or @ directives
-        let tokens = crate::generic::tokenize_generic(source, "html");
-        let detection = tokens_to_detection(tokens, options);
-        return if detection.is_empty() {
-            Vec::new()
-        } else {
-            vec![TokenMap {
-                format: "html".to_string(),
-                tokens: detection,
-            }]
-        };
+        return html_only_maps(source, options);
     }
 
     let blank_ranges: Vec<[usize; 2]> = blocks
@@ -172,7 +155,7 @@ pub fn tokenize_razor_maps(source: &str, options: &TokenizeOptions) -> Vec<Token
 
     // Tokenize HTML skeleton (with code blanked)
     let html_tokens = crate::generic::tokenize_generic(&sanitized, "html");
-    let mut html_detection = tokens_to_detection(html_tokens, options);
+    let mut html_detection = tokens_to_detection(html_tokens, options, NameRules::default());
     html_detection.retain(|t| t.range[0] < t.range[1]);
     if !html_detection.is_empty() {
         grouped
@@ -183,7 +166,8 @@ pub fn tokenize_razor_maps(source: &str, options: &TokenizeOptions) -> Vec<Token
 
     // Tokenize code blocks
     for block in &blocks {
-        let inner_tokens = tokenize_format_to_detection("csharp", &block.content, options);
+        let inner_tokens =
+            tokenize_block_to_detection("csharp", &block.content, block.start_offset, options);
 
         if !inner_tokens.is_empty() {
             let inner_start_loc = line_index.location(block.start_offset);
@@ -217,17 +201,18 @@ pub fn tokenize_razor(source: &str, mode: Mode) -> Vec<Token> {
     // Tokenize HTML skeleton with Razor code blanked out to avoid duplicate code tokens.
     all_tokens.extend(crate::generic::tokenize_generic(&sanitized, "html"));
 
-    for block in &blocks {
-        let mut block_tokens = crate::tokenizer::tokenize("csharp", &block.content, mode);
+    all_tokens.extend(tokenize_blocks_shifted(
+        source,
+        blocks
+            .iter()
+            .map(|b| ("csharp", b.content.as_str(), b.start_offset)),
+        mode,
+    ));
 
-        let line_offset = block.start_line.saturating_sub(1);
-        for token in &mut block_tokens {
-            token.start.line += line_offset;
-            token.end.line += line_offset;
-        }
-        all_tokens.extend(block_tokens);
-    }
-
+    // In the order of the text. The HTML and then the C# went back to line 1
+    // where the C# began, and a clone across that seam ended before it
+    // started (issue #1221).
+    all_tokens.sort_by_key(|token| token.start.offset);
     all_tokens
 }
 
@@ -440,6 +425,29 @@ mod tests {
         assert!(
             tokens.iter().any(|t| t.value == "foreach"),
             "must include csharp tokens"
+        );
+    }
+
+    #[test]
+    fn tokenize_razor_reads_a_view_in_the_order_of_its_text() {
+        // The C# of `<h1>@Model.Title</h1>` comes between the tags of its
+        // line, not after the HTML of the whole view (issue #1221).
+        let tokens = tokenize_razor(RAZOR_CSHARP, Mode::Mild);
+        assert!(
+            tokens
+                .windows(2)
+                .all(|pair| pair[0].start.offset <= pair[1].start.offset)
+        );
+        let line: Vec<&str> = tokens
+            .iter()
+            .filter(|t| t.start.line == 5 && !t.value.trim().is_empty())
+            .map(|t| t.value.as_str())
+            .collect();
+        let title = line.iter().position(|&v| v == "Title").unwrap();
+        assert_eq!(line.iter().filter(|&&v| v == "h1").count(), 2, "{line:?}");
+        assert!(
+            line[..title].contains(&"h1") && line[title..].contains(&"h1"),
+            "{line:?}"
         );
     }
 

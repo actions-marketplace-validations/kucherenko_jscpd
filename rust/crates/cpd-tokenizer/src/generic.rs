@@ -17,8 +17,9 @@ enum CommentStyle {
     Semicolon,
     /// Single-line `'`
     VisualBasic,
-    /// No comments (fallback for unrecognised formats)
-    #[allow(dead_code)]
+    /// Single-line `%`
+    Percent,
+    /// No comments
     None,
 }
 
@@ -30,21 +31,56 @@ fn comment_style(format: &str) -> CommentStyle {
         | "json5" | "less" | "scss" | "css" | "objectivec" | "protobuf" | "apex" | "verilog"
         | "zig" | "odin" | "fsharp" | "actionscript" | "cfscript" => CommentStyle::CStyle,
 
+        // Nix belongs here although it also has `/* */`: its `//` is the
+        // attribute-set update operator, not a comment. `dockerfile` stays
+        // for configs that named the format that way in `formatsNames`.
         "python" | "ruby" | "perl" | "bash" | "sh" | "zsh" | "fish" | "r" | "julia" | "yaml"
-        | "toml" | "dockerfile" | "makefile" | "cmake" | "coffeescript" | "crystal" | "nim"
-        | "gdscript" | "elixir" | "awk" | "tcl" | "powershell" | "puppet" | "ignore" => {
-            CommentStyle::Hash
-        }
+        | "toml" | "docker" | "dockerfile" | "makefile" | "cmake" | "coffeescript" | "crystal"
+        | "nim" | "gdscript" | "elixir" | "awk" | "tcl" | "powershell" | "puppet" | "ignore"
+        | "apacheconf" | "nginx" | "nix" | "bro" | "http" | "icon" | "renpy" | "rip" | "jq"
+        | "promql" | "rego" | "smali" | "typoscript" | "editorconfig" => CommentStyle::Hash,
 
-        "sql" | "haskell" | "elm" | "ada" | "plsql" => CommentStyle::DoubleDash,
+        "sql" | "haskell" | "elm" | "ada" | "plsql" | "agda" | "dhall" | "applescript" | "n1ql" => {
+            CommentStyle::DoubleDash
+        }
 
         "lua" => CommentStyle::Lua,
 
-        "ini" | "properties" | "asm6502" | "nasm" | "lisp" | "clojure" | "scheme" | "racket" => {
+        "ini" | "properties" | "asm6502" | "nasm" | "lisp" | "clojure" | "scheme" | "racket"
+        | "autohotkey" | "autoit" | "wasm" | "abnf" | "dns-zone-file" | "gcode" => {
             CommentStyle::Semicolon
         }
 
-        "vb" | "vbs" | "basic" | "vbnet" | "visual-basic" => CommentStyle::VisualBasic,
+        "vb" | "vbs" | "basic" | "vbnet" | "visual-basic" | "monkey" | "xojo" => {
+            CommentStyle::VisualBasic
+        }
+
+        "erlang" | "matlab" => CommentStyle::Percent,
+
+        // Comment markers this tokenizer does not read: `%%` (Mermaid), `REM`
+        // and `::` (batch), `*>` (COBOL), `NB.` (J), `BTW`
+        // (LOLCODE), `"` (Vim, ABAP), `!` (Factor), `[ ]` (Inform 7), and the
+        // comment tags of template languages. Their comments stay ordinary
+        // tokens, which costs less than the C fallback: in a template or a
+        // batch file `https://` and `src/*` are common, and would hide code.
+        "batch" | "cobol" | "j" | "lolcode" | "vim" | "abap" | "factor" | "inform7" | "mizar"
+        | "bnf" | "ebnf" | "regex" | "shell-session" | "django" | "erb" | "liquid" | "ftl"
+        | "mermaid" => CommentStyle::None,
+
+        // Prose markup, like Markdown below.
+        "asciidoc" | "rest" | "wiki" => CommentStyle::None,
+
+        // Markdown has no comment of its own. CommonMark defines only the HTML
+        // comment, as HTML block type 2. Without this arm Markdown prose falls
+        // to the C style below, and then a `/*` that prose can hold — inside a
+        // glob such as `docs/**`, or in a code span — opens a block comment
+        // that never closes. Every later clone in that file goes unreported.
+        "markdown" | "md" => CommentStyle::None,
+
+        // Plain text, logs and CSV have no comment syntax either, and take the
+        // same loss through the C fallback: a path glob such as `logs/**`
+        // hides the rest of the file, and `https://` hides the rest of a line.
+        "txt" | "log" | "csv" => CommentStyle::None,
 
         _ => CommentStyle::CStyle,
     }
@@ -56,14 +92,6 @@ fn is_ignore_start(text: &str) -> bool {
 
 fn is_ignore_end(text: &str) -> bool {
     text.contains("jscpd:ignore-end")
-}
-
-fn comment_kind(in_ignore: bool) -> TokenKind {
-    if in_ignore {
-        TokenKind::Ignore
-    } else {
-        TokenKind::Comment
-    }
 }
 
 fn make_token(kind: TokenKind, value: &str, line: u32, col: u32, offset: u32) -> Token {
@@ -94,6 +122,158 @@ fn classify_word(word: &str) -> TokenKind {
     TokenKind::Identifier
 }
 
+/// A line being cut into tokens: its characters, how far the cut has reached,
+/// and the column that position sits at. Columns count UTF-8 bytes, as token
+/// offsets do.
+struct LineCursor<'a> {
+    line: &'a str,
+    chars: Vec<(usize, char)>,
+    at: usize,
+    col: u32,
+    line_num: u32,
+    line_offset: u32,
+    in_ignore: bool,
+    tokens: Vec<Token>,
+}
+
+impl<'a> LineCursor<'a> {
+    fn new(line: &'a str, line_num: u32, line_offset: u32, in_ignore: bool) -> Self {
+        Self {
+            line,
+            chars: line.char_indices().collect(),
+            at: 0,
+            col: 0,
+            line_num,
+            line_offset,
+            in_ignore,
+            tokens: Vec::new(),
+        }
+    }
+
+    fn peek(&self, ahead: usize) -> Option<char> {
+        self.chars.get(self.at + ahead).map(|&(_, c)| c)
+    }
+
+    /// Whether the characters from the cursor on spell `text`.
+    fn looking_at(&self, text: &str) -> bool {
+        text.chars()
+            .enumerate()
+            .all(|(ahead, c)| self.peek(ahead) == Some(c))
+    }
+
+    /// `kind`, unless the line lies inside a `jscpd:ignore` region.
+    fn kind(&self, kind: TokenKind) -> TokenKind {
+        match self.in_ignore {
+            true => TokenKind::Ignore,
+            false => kind,
+        }
+    }
+
+    fn advance(&mut self) {
+        if let Some(&(_, c)) = self.chars.get(self.at) {
+            self.col += c.len_utf8() as u32;
+            self.at += 1;
+        }
+    }
+
+    fn byte(&self, index: usize) -> usize {
+        self.chars
+            .get(index)
+            .map_or(self.line.len(), |&(byte, _)| byte)
+    }
+
+    /// Emit the characters from `start`, which sat at column `start_col`, up
+    /// to the cursor.
+    fn emit_from(&mut self, kind: TokenKind, start: usize, start_col: u32) {
+        let text = &self.line[self.byte(start)..self.byte(self.at)];
+        self.tokens.push(make_token(
+            kind,
+            text,
+            self.line_num,
+            start_col,
+            self.line_offset + start_col,
+        ));
+    }
+
+    /// The next `count` characters, as one token.
+    fn take(&mut self, kind: TokenKind, count: usize) {
+        let (start, start_col) = (self.at, self.col);
+        for _ in 0..count {
+            self.advance();
+        }
+        self.emit_from(kind, start, start_col);
+    }
+
+    /// Characters for as long as `keep` holds, as one token.
+    fn take_while(&mut self, kind: TokenKind, keep: impl Fn(char) -> bool) {
+        let (start, start_col) = (self.at, self.col);
+        while self.peek(0).is_some_and(&keep) {
+            self.advance();
+        }
+        self.emit_from(kind, start, start_col);
+    }
+
+    /// Everything left on the line, as one token.
+    fn take_rest(&mut self, kind: TokenKind) {
+        let (start, start_col) = (self.at, self.col);
+        self.at = self.chars.len();
+        self.emit_from(kind, start, start_col);
+    }
+
+    /// A quoted string up to and including its closing quote, or to the end
+    /// of the line when it has none. A backslash escapes the character after
+    /// it.
+    fn take_string(&mut self) {
+        let (start, start_col) = (self.at, self.col);
+        let quote = self.peek(0);
+        self.advance();
+        while let Some(c) = self.peek(0) {
+            if Some(c) == quote {
+                break;
+            }
+            if c == '\\' && self.peek(1).is_some() {
+                self.advance();
+            }
+            self.advance();
+        }
+        self.advance();
+        let kind = self.kind(TokenKind::Literal);
+        self.emit_from(kind, start, start_col);
+    }
+
+    /// An identifier or keyword; a word of digits alone is a literal.
+    fn take_word(&mut self) {
+        let (start, start_col) = (self.at, self.col);
+        while self
+            .peek(0)
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            self.advance();
+        }
+        let kind = match self.in_ignore {
+            true => TokenKind::Ignore,
+            false => classify_word(&self.line[self.byte(start)..self.byte(self.at)]),
+        };
+        self.emit_from(kind, start, start_col);
+    }
+}
+
+/// Whether a line comment in this style starts at the cursor.
+///
+/// Lua's long comment `--[[` starts with its line comment `--`, and is read
+/// the same way: the rest of the line is the comment.
+fn opens_line_comment(style: CommentStyle, cursor: &LineCursor) -> bool {
+    match style {
+        CommentStyle::CStyle => cursor.looking_at("//"),
+        CommentStyle::Hash => cursor.looking_at("#"),
+        CommentStyle::DoubleDash | CommentStyle::Lua => cursor.looking_at("--"),
+        CommentStyle::Semicolon => cursor.looking_at(";"),
+        CommentStyle::VisualBasic => cursor.looking_at("'"),
+        CommentStyle::Percent => cursor.looking_at("%"),
+        CommentStyle::None => false,
+    }
+}
+
 fn tokenize_line_content(
     line: &str,
     line_num: u32,
@@ -102,246 +282,59 @@ fn tokenize_line_content(
     in_ignore: bool,
     in_block_comment: &mut bool,
 ) -> Vec<Token> {
-    let mut tokens = Vec::new();
-
-    // Collect (byte_offset, char) pairs once — zero heap allocation vs chars().collect().
-    // `char_indices()` returns (byte_index, char) which gives us correct UTF-8 byte offsets
-    // for column accounting while avoiding a Vec<char> heap allocation per line.
-    let chars: Vec<(usize, char)> = line.char_indices().collect();
-    let n = chars.len();
-    let mut i = 0usize;
-
-    // col is in bytes (UTF-8 units), consistent with char.len_utf8() increments below.
-    let mut col = 0u32;
-
-    macro_rules! offset {
-        () => {
-            line_offset + col
-        };
-    }
-
-    while i < n {
-        let (_, ch) = chars[i];
-
-        // Handle block comment end
+    let mut cursor = LineCursor::new(line, line_num, line_offset, in_ignore);
+    let c_style = style == CommentStyle::CStyle;
+    while let Some(ch) = cursor.peek(0) {
         if *in_block_comment {
-            let kind = comment_kind(in_ignore);
-            if matches!(style, CommentStyle::CStyle)
-                && i + 1 < n
-                && ch == '*'
-                && chars[i + 1].1 == '/'
-            {
-                let start_col = col;
-                let start_off = offset!();
-                col += 2;
-                i += 2;
-                tokens.push(make_token(kind, "*/", line_num, start_col, start_off));
-                *in_block_comment = false;
-                continue;
-            }
-            // Still inside block comment — consume char
-            let start_col = col;
-            let start_off = offset!();
-            let mut s = String::new();
-            s.push(ch);
-            col += ch.len_utf8() as u32;
-            i += 1;
-            tokens.push(make_token(kind, &s, line_num, start_col, start_off));
-            continue;
-        }
-
-        // Lua long block comment --[[
-        if matches!(style, CommentStyle::Lua)
-            && i + 3 < n
-            && ch == '-'
-            && chars[i + 1].1 == '-'
-            && chars[i + 2].1 == '['
-            && chars[i + 3].1 == '['
-        {
-            let rest = &line[chars[i].0..];
-            tokens.push(make_token(
-                comment_kind(in_ignore),
-                rest,
-                line_num,
-                col,
-                offset!(),
-            ));
-            break;
-        }
-
-        // C-style block comment open /*
-        if matches!(style, CommentStyle::CStyle) && i + 1 < n && ch == '/' && chars[i + 1].1 == '*'
-        {
+            // Inside `/* … */` each character is a comment token of its own.
+            let closes = c_style && cursor.looking_at("*/");
+            cursor.take(cursor.kind(TokenKind::Comment), if closes { 2 } else { 1 });
+            *in_block_comment = !closes;
+        } else if c_style && cursor.looking_at("/*") {
+            cursor.take(cursor.kind(TokenKind::Comment), 2);
             *in_block_comment = true;
-            let start_col = col;
-            let start_off = offset!();
-            col += 2;
-            i += 2;
-            tokens.push(make_token(
-                comment_kind(in_ignore),
-                "/*",
-                line_num,
-                start_col,
-                start_off,
-            ));
-            continue;
-        }
-
-        // Line comment — check current position directly without allocating
-        let is_comment = match style {
-            CommentStyle::CStyle => i + 1 < n && ch == '/' && chars[i + 1].1 == '/',
-            CommentStyle::Hash => ch == '#',
-            CommentStyle::DoubleDash | CommentStyle::Lua => {
-                i + 1 < n && ch == '-' && chars[i + 1].1 == '-'
-            }
-            CommentStyle::Semicolon => ch == ';',
-            CommentStyle::VisualBasic => ch == '\'',
-            CommentStyle::None => false,
-        };
-
-        if is_comment {
-            let rest = &line[chars[i].0..];
-            tokens.push(make_token(
-                comment_kind(in_ignore),
-                rest,
-                line_num,
-                col,
-                offset!(),
-            ));
+        } else if opens_line_comment(style, &cursor) {
+            cursor.take_rest(cursor.kind(TokenKind::Comment));
             break;
-        }
-
-        // String literals (double-quote or single-quote)
-        if ch == '"' || ch == '\'' {
-            let quote = ch;
-            let start_col = col;
-            let start_off = offset!();
-            let mut j = chars[i].0; // byte start of string in `line`
-            let str_start = j;
-            col += 1;
-            i += 1;
-            j += 1;
-            while i < n && chars[i].1 != quote {
-                if chars[i].1 == '\\' && i + 1 < n {
-                    col += chars[i].1.len_utf8() as u32 + chars[i + 1].1.len_utf8() as u32;
-                    i += 2;
-                } else {
-                    col += chars[i].1.len_utf8() as u32;
-                    i += 1;
-                }
-            }
-            if i < n {
-                col += 1;
-                i += 1;
-            }
-            let str_end = if i < n {
-                chars[i - 1].0 + chars[i - 1].1.len_utf8()
-            } else {
-                line.len()
-            };
-            let _ = (j, str_start); // byte indices computed above but using slice below
-            let s = &line[str_start..str_end];
-            let kind = if in_ignore {
-                TokenKind::Ignore
-            } else {
-                TokenKind::Literal
-            };
-            tokens.push(make_token(kind, s, line_num, start_col, start_off));
-            continue;
-        }
-
-        // Whitespace
-        if ch.is_whitespace() {
-            let start_col = col;
-            let start_off = offset!();
-            let byte_start = chars[i].0;
-            while i < n && chars[i].1.is_whitespace() {
-                col += chars[i].1.len_utf8() as u32;
-                i += 1;
-            }
-            let byte_end = if i < n { chars[i].0 } else { line.len() };
-            let kind = if in_ignore {
-                TokenKind::Ignore
-            } else {
-                TokenKind::Whitespace
-            };
-            tokens.push(make_token(
-                kind,
-                &line[byte_start..byte_end],
-                line_num,
-                start_col,
-                start_off,
-            ));
-            continue;
-        }
-
-        // Numbers
-        if ch.is_ascii_digit() {
-            let start_col = col;
-            let start_off = offset!();
-            let byte_start = chars[i].0;
-            while i < n && (chars[i].1.is_ascii_digit() || chars[i].1 == '.') {
-                col += 1;
-                i += 1;
-            }
-            let byte_end = if i < n { chars[i].0 } else { line.len() };
-            let kind = if in_ignore {
-                TokenKind::Ignore
-            } else {
-                TokenKind::Literal
-            };
-            tokens.push(make_token(
-                kind,
-                &line[byte_start..byte_end],
-                line_num,
-                start_col,
-                start_off,
-            ));
-            continue;
-        }
-
-        // Identifiers / keywords
-        if ch.is_alphabetic() || ch == '_' {
-            let start_col = col;
-            let start_off = offset!();
-            let byte_start = chars[i].0;
-            while i < n && (chars[i].1.is_alphanumeric() || chars[i].1 == '_') {
-                col += chars[i].1.len_utf8() as u32;
-                i += 1;
-            }
-            let byte_end = if i < n { chars[i].0 } else { line.len() };
-            let s = &line[byte_start..byte_end];
-            let kind = if in_ignore {
-                TokenKind::Ignore
-            } else {
-                classify_word(s)
-            };
-            tokens.push(make_token(kind, s, line_num, start_col, start_off));
-            continue;
-        }
-
-        // Operators / punctuation (single char)
-        let start_col = col;
-        let start_off = offset!();
-        let byte_start = chars[i].0;
-        col += ch.len_utf8() as u32;
-        i += 1;
-        let byte_end = if i < n { chars[i].0 } else { line.len() };
-        let kind = if in_ignore {
-            TokenKind::Ignore
+        } else if ch == '"' || ch == '\'' {
+            cursor.take_string();
+        } else if ch.is_whitespace() {
+            cursor.take_while(cursor.kind(TokenKind::Whitespace), char::is_whitespace);
+        } else if ch.is_ascii_digit() {
+            cursor.take_while(cursor.kind(TokenKind::Literal), |c| {
+                c.is_ascii_digit() || c == '.'
+            });
+        } else if ch.is_alphabetic() || ch == '_' {
+            cursor.take_word();
         } else {
-            TokenKind::Punctuation
-        };
-        tokens.push(make_token(
-            kind,
-            &line[byte_start..byte_end],
-            line_num,
-            start_col,
-            start_off,
-        ));
+            cursor.take(cursor.kind(TokenKind::Punctuation), 1);
+        }
     }
+    cursor.tokens
+}
 
-    tokens
+/// The byte ranges whose tokens [`tokenize_generic`] marks as ignored or
+/// drops: from the start of a line with `jscpd:ignore-start` through the
+/// end of the next line with `jscpd:ignore-end`, to the end of the source
+/// when none follows. A line with `jscpd:ignore-end` is dropped whole, even
+/// outside a block.
+pub(crate) fn ignore_line_ranges(source: &str) -> Vec<[usize; 2]> {
+    let mut ranges = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut offset = 0usize;
+    for raw in source.split_inclusive('\n') {
+        let trimmed = raw.trim();
+        let end = offset + raw.len();
+        if is_ignore_start(trimmed) && open.is_none() {
+            open = Some(offset);
+        }
+        if is_ignore_end(trimmed) {
+            ranges.push([open.take().unwrap_or(offset), end]);
+        }
+        offset = end;
+    }
+    ranges.extend(open.map(|start| [start, source.len()]));
+    ranges
 }
 
 /// Tokenize source in the given format. Never panics on empty input.
@@ -356,7 +349,13 @@ pub fn tokenize_generic(source: &str, format: &str) -> Vec<Token> {
     let mut in_block_comment = false;
     let mut offset = 0u32;
 
-    for (line_idx, line) in source.lines().enumerate() {
+    // `split_inclusive` keeps each line's ending, so offsets advance by the
+    // bytes really there: `\r\n` counts two, and CRLF files keep true byte
+    // offsets (with `lines()`, every line drifted by the dropped `\r`).
+    for (line_idx, raw) in source.split_inclusive('\n').enumerate() {
+        let line = raw
+            .strip_suffix('\n')
+            .map_or(raw, |l| l.strip_suffix('\r').unwrap_or(l));
         let line_num = line_idx as u32 + 1;
         let trimmed = line.trim();
 
@@ -366,7 +365,7 @@ pub fn tokenize_generic(source: &str, format: &str) -> Vec<Token> {
         if is_ignore_end(trimmed) {
             in_ignore = false;
             // Advance offset past this line and continue
-            offset += line.len() as u32 + 1;
+            offset += raw.len() as u32;
             continue;
         }
 
@@ -379,7 +378,7 @@ pub fn tokenize_generic(source: &str, format: &str) -> Vec<Token> {
             &mut in_block_comment,
         );
         tokens.extend(line_tokens);
-        offset += line.len() as u32 + 1;
+        offset += raw.len() as u32;
     }
 
     tokens
@@ -388,6 +387,20 @@ pub fn tokenize_generic(source: &str, format: &str) -> Vec<Token> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_offsets_are_byte_offsets() {
+        let src = "let a = 1;\r\nlet b = 2;\r\n";
+        for token in tokenize_generic(src, "rust") {
+            let slice = &src[token.start.offset as usize..token.end.offset as usize];
+            assert_eq!(slice, token.value, "{token:?}");
+        }
+        let b = tokenize_generic(src, "rust")
+            .into_iter()
+            .find(|t| t.value == "b")
+            .unwrap();
+        assert_eq!((b.start.line, b.start.column, b.start.offset), (2, 4, 16));
+    }
 
     #[test]
     fn python_produces_tokens() {
@@ -454,6 +467,120 @@ mod tests {
         let tokens = tokenize_generic("/* block */\nint x = 1;\n", "c");
         let has_comment = tokens.iter().any(|t| t.kind == TokenKind::Comment);
         assert!(has_comment);
+    }
+
+    #[test]
+    fn markdown_has_no_block_comment() {
+        // A glob in prose holds `/*`. Markdown has no block comment, so the
+        // text after it must stay ordinary code tokens.
+        let tokens = tokenize_generic("Ignore `docs/**` here.\nThe next line.\n", "markdown");
+        let has_comment = tokens.iter().any(|t| t.kind == TokenKind::Comment);
+        assert!(
+            !has_comment,
+            "Markdown has no block comment, so `/*` must not open one"
+        );
+        let last = tokens.last().expect("at least one token");
+        assert_eq!(
+            last.start.line, 2,
+            "text after `/*` must still produce tokens"
+        );
+    }
+
+    #[test]
+    fn markdown_has_no_line_comment() {
+        let tokens = tokenize_generic("A URL like https://example.com/x\n", "markdown");
+        let has_comment = tokens.iter().any(|t| t.kind == TokenKind::Comment);
+        assert!(!has_comment, "`//` must not open a comment in Markdown");
+    }
+
+    #[test]
+    fn plain_text_formats_have_no_comments() {
+        for format in ["txt", "log", "csv"] {
+            let tokens = tokenize_generic(
+                "Skip `docs/**` and see https://example.com/x
+The next line.
+",
+                format,
+            );
+            let has_comment = tokens.iter().any(|t| t.kind == TokenKind::Comment);
+            assert!(!has_comment, "{format} has no comment syntax");
+            let last = tokens.last().expect("at least one token");
+            assert_eq!(
+                last.start.line, 2,
+                "{format}: text after `/*` must still produce tokens"
+            );
+        }
+    }
+
+    /// The lines on which `format` reads a comment in `source`.
+    fn comment_lines(source: &str, format: &str) -> Vec<u32> {
+        let mut lines: Vec<u32> = tokenize_generic(source, format)
+            .iter()
+            .filter(|t| t.kind == TokenKind::Comment)
+            .map(|t| t.start.line)
+            .collect();
+        lines.dedup();
+        lines
+    }
+
+    #[test]
+    fn dockerfile_comments_are_hash_comments() {
+        // `src/*` used to open a C block comment that hid the rest of the file.
+        let source = "# build stage\nCOPY src/* /app/\nRUN make\n";
+        assert_eq!(comment_lines(source, "docker"), [1]);
+        let tokens = tokenize_generic(source, "docker");
+        assert_eq!(tokens.last().map(|t| t.start.line), Some(3));
+    }
+
+    #[test]
+    fn erlang_and_matlab_comments_start_with_percent() {
+        // `src/*` inside a `%` comment used to open a C block comment.
+        let source = "%% records for src/* modules\n-record(user, {id}).\n";
+        assert_eq!(comment_lines(source, "erlang"), [1]);
+        assert_eq!(comment_lines("% total\nx = sum(a);\n", "matlab"), [1]);
+    }
+
+    #[test]
+    fn a_dockerfile_format_from_a_mapping_reads_hash_comments() {
+        let source = "# build stage\nCOPY src/* /app/\nRUN make\n";
+        assert_eq!(comment_lines(source, "dockerfile"), [1]);
+    }
+
+    #[test]
+    fn nix_update_operator_is_not_a_comment() {
+        assert_eq!(
+            comment_lines("# defaults\nbase // { x = 1; }\n", "nix"),
+            [1]
+        );
+    }
+
+    #[test]
+    fn line_comments_of_newly_mapped_formats() {
+        for (format, source) in [
+            ("nginx", "# c\nlisten 80;\n"),
+            ("rego", "# c\nallow { true }\n"),
+            ("wasm", ";; c\n(module)\n"),
+            ("autohotkey", "; c\nx := 1\n"),
+            ("dns-zone-file", "; c\n@ IN A 10.0.0.1\n"),
+            ("dhall", "-- c\nlet x = 1\n"),
+            ("applescript", "-- c\nset x to 1\n"),
+            ("monkey", "' c\nLocal x:Int\n"),
+            ("xojo", "' c\nDim x As Integer\n"),
+        ] {
+            assert_eq!(comment_lines(source, format), [1], "{format}");
+        }
+    }
+
+    #[test]
+    fn formats_without_a_comment_rule_keep_urls_and_globs() {
+        for format in [
+            "batch", "django", "erb", "liquid", "ftl", "vim", "cobol", "asciidoc", "rest", "wiki",
+        ] {
+            let source = "see https://example.com/x and src/*.txt\nnext line\n";
+            assert!(comment_lines(source, format).is_empty(), "{format}");
+            let tokens = tokenize_generic(source, format);
+            assert_eq!(tokens.last().map(|t| t.start.line), Some(2), "{format}");
+        }
     }
 
     #[test]

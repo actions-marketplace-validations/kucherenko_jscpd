@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 
 use cpd_core::models::{DetectionToken, Token};
 
-use crate::embedded::blank_ranges_preserve_newlines;
+use crate::embedded::{blank_ranges_preserve_newlines, html_only_maps, tokenize_blocks_shifted};
 use crate::line_index::LineIndex;
 use crate::markdown::{offset_detection_tokens, tokens_to_detection};
-use crate::tokenizer::{Mode, TokenMap, TokenizeOptions, tokenize_format_to_detection};
+use crate::tokenizer::{Mode, NameRules, TokenMap, TokenizeOptions, tokenize_block_to_detection};
 
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -15,9 +15,7 @@ pub struct Block {
     pub start_line: u32,
 }
 
-#[allow(dead_code)]
 struct SfcBlock {
-    tag: String,
     block_format: String,
     block_start: usize,
     inner_start: usize,
@@ -36,16 +34,7 @@ pub fn tokenize_sfc_maps(
 
     let blocks = find_sfc_blocks(source, file_format);
     if blocks.is_empty() {
-        let tokens = crate::generic::tokenize_generic(source, "html");
-        let detection = tokens_to_detection(tokens, options);
-        return if detection.is_empty() {
-            Vec::new()
-        } else {
-            vec![TokenMap {
-                format: "html".to_string(),
-                tokens: detection,
-            }]
-        };
+        return html_only_maps(source, options);
     }
 
     let blank_ranges: Vec<[usize; 2]> = blocks
@@ -64,10 +53,22 @@ pub fn tokenize_sfc_maps(
 
     let mut grouped: BTreeMap<String, Vec<DetectionToken>> = BTreeMap::new();
 
+    // A Vue file is top-level blocks only: all markup lives inside
+    // `<template>`, so what remains outside the blocks is just the wrapper
+    // tags — `<template>`, `</template>`, `<script ...>`, `</script>`,
+    // `<style ...>`, `</style>`. Those tags are identical in every Vue file
+    // and sit at both ends of it; fed into the html stream they would stretch
+    // every template clone to the last `</style>` and count the script and
+    // style bodies as duplicated html lines. That holds with or without a
+    // template block (a script-only component has nothing but wrapper tags
+    // outside its blocks). Svelte and Astro have no template wrapper: their
+    // top-level markup is the skeleton and is kept.
+    let wrapper_tags_only = file_format == "vue";
+
     let markup_tokens = crate::generic::tokenize_generic(&sanitized, "html");
-    let mut markup_detection = tokens_to_detection(markup_tokens, options);
+    let mut markup_detection = tokens_to_detection(markup_tokens, options, NameRules::default());
     markup_detection.retain(|t| t.range[0] < t.range[1]);
-    if !markup_detection.is_empty() {
+    if !markup_detection.is_empty() && !wrapper_tags_only {
         grouped
             .entry("html".to_string())
             .or_default()
@@ -81,7 +82,8 @@ pub fn tokenize_sfc_maps(
         let inner = &source[block.inner_start..block.inner_end];
         let inner_start_loc = line_index.location(block.inner_start);
 
-        let mut inner_tokens = tokenize_sfc_block_inner(&block.block_format, inner, options);
+        let mut inner_tokens =
+            tokenize_block_to_detection(&block.block_format, inner, block.inner_start, options);
         offset_detection_tokens(&mut inner_tokens, block.inner_start, &inner_start_loc);
 
         grouped
@@ -90,10 +92,38 @@ pub fn tokenize_sfc_maps(
             .extend(inner_tokens);
     }
 
+    // Skeleton and block-inner tokens are collected separately — restore
+    // source order so clone endpoints follow the file.
+    if let Some(tokens) = grouped.get_mut("html") {
+        tokens.sort_by_key(|token| token.range[0]);
+    }
+
     grouped
         .into_iter()
         .filter(|(_, tokens)| !tokens.is_empty())
         .map(|(format, tokens)| TokenMap { format, tokens })
+        .collect()
+}
+
+/// The code blocks of a Vue, Svelte or Astro file that functions live in —
+/// `<script>` blocks and Astro frontmatter — with their format and the byte
+/// range of their content in `source`.
+pub fn script_blocks(source: &str, file_format: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    embedded_blocks(source, file_format)
+        .into_iter()
+        .filter(|(format, _)| !matches!(format.as_str(), "html" | "pug" | "css" | "scss" | "less"))
+        .collect()
+}
+
+/// Every block of a Vue, Svelte or Astro file that [`tokenize_sfc_maps`]
+/// tokenizes in a language of its own, with its format and the byte range of
+/// its content in `source`: templates, scripts, styles and Astro's
+/// frontmatter. Empty blocks are left out.
+pub fn embedded_blocks(source: &str, file_format: &str) -> Vec<(String, std::ops::Range<usize>)> {
+    find_sfc_blocks(source, file_format)
+        .into_iter()
+        .filter(|b| b.inner_start < b.inner_end)
+        .map(|b| (b.block_format, b.inner_start..b.inner_end))
         .collect()
 }
 
@@ -133,14 +163,6 @@ fn find_sfc_blocks(source: &str, file_format: &str) -> Vec<SfcBlock> {
         }
     }
     deduped
-}
-
-fn tokenize_sfc_block_inner(
-    format: &str,
-    source: &str,
-    options: &TokenizeOptions,
-) -> Vec<DetectionToken> {
-    tokenize_format_to_detection(format, source, options)
 }
 
 fn find_tag_bounds(
@@ -188,7 +210,6 @@ fn find_sfc_tag_block(
     let block_format = detect_sfc_block_format(attrs, tag);
 
     Some(SfcBlock {
-        tag: tag.to_string(),
         block_format,
         block_start: open_start,
         inner_start,
@@ -246,7 +267,7 @@ fn astro_frontmatter_block(source: &str) -> Option<SfcBlock> {
         .iter()
         .enumerate()
         .skip(1)
-        .find(|(_, span)| source[span.start..span.end].trim() == "---")
+        .find(|(_, span)| source[span.start..span.end].trim_end() == "---")
         .map(|(idx, _)| idx)?;
     let inner_start = lines.get(1)?.start;
     let inner_end = source[..lines[close_idx].start]
@@ -255,7 +276,6 @@ fn astro_frontmatter_block(source: &str) -> Option<SfcBlock> {
         .unwrap_or(lines[close_idx].start);
     let block_end = lines[close_idx].next_start.min(source.len());
     Some(SfcBlock {
-        tag: "script".to_string(),
         block_format: "typescript".to_string(),
         block_start: 0,
         inner_start,
@@ -324,20 +344,13 @@ fn find_display_block(
 
 pub fn tokenize_sfc(source: &str, file_format: &str, mode: Mode) -> Vec<Token> {
     let blocks = extract_blocks(source, file_format);
-    let mut all_tokens = Vec::new();
-
-    for block in &blocks {
-        let mut block_tokens =
-            crate::tokenizer::tokenize(&block.block_format, &block.content, mode);
-        let line_offset = block.start_line.saturating_sub(1);
-        for token in &mut block_tokens {
-            token.start.line += line_offset;
-            token.end.line += line_offset;
-        }
-        all_tokens.extend(block_tokens);
-    }
-
-    all_tokens
+    tokenize_blocks_shifted(
+        source,
+        blocks
+            .iter()
+            .map(|b| (b.block_format.as_str(), b.content.as_str(), b.start_offset)),
+        mode,
+    )
 }
 
 #[cfg(test)]
@@ -426,6 +439,58 @@ const x: number = 5;
     }
 
     #[test]
+    fn vue_html_map_tokens_remain_in_source_order() {
+        let maps = tokenize_sfc_maps(VUE_FILE, "vue", &TokenizeOptions::new(Mode::Mild));
+        let html = maps.iter().find(|map| map.format == "html").unwrap();
+
+        assert!(
+            html.tokens
+                .windows(2)
+                .all(|pair| pair[0].range[0] <= pair[1].range[0]),
+            "HTML tokens must remain in source order"
+        );
+    }
+
+    #[test]
+    fn vue_html_map_holds_only_the_template_body() {
+        let maps = tokenize_sfc_maps(VUE_FILE, "vue", &TokenizeOptions::new(Mode::Mild));
+        let html = maps.iter().find(|map| map.format == "html").unwrap();
+        let template_start = VUE_FILE.find("<template>").unwrap() + "<template>".len();
+        let template_end = VUE_FILE.find("</template>").unwrap();
+        assert!(
+            html.tokens
+                .iter()
+                .all(|t| t.range[0] >= template_start && t.range[1] <= template_end),
+            "wrapper tags must not enter the html stream: {:?}",
+            html.tokens.iter().map(|t| t.range).collect::<Vec<_>>()
+        );
+        assert_eq!(html.tokens.first().unwrap().start.line, 2);
+        assert_eq!(html.tokens.last().unwrap().end.line, 2);
+    }
+
+    #[test]
+    fn vue_without_template_has_no_html_map() {
+        let source = "<script>\nexport default { render: (h) => h('div', 'x') }\n</script>\n<style>\n.x { margin: 0; }\n</style>\n";
+        let maps = tokenize_sfc_maps(source, "vue", &TokenizeOptions::new(Mode::Mild));
+        assert!(
+            maps.iter().all(|map| map.format != "html"),
+            "wrapper tags alone must not form an html map: {:?}",
+            maps.iter().map(|m| m.format.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn svelte_keeps_top_level_markup() {
+        let source = "<script>\nlet n = 1;\n</script>\n<h1>Count {n}</h1>\n<button on:click={() => n++}>add</button>\n";
+        let maps = tokenize_sfc_maps(source, "svelte", &TokenizeOptions::new(Mode::Mild));
+        let html = maps.iter().find(|map| map.format == "html").unwrap();
+        assert!(
+            html.tokens.iter().any(|t| t.start.line == 4),
+            "top-level markup is the html map"
+        );
+    }
+
+    #[test]
     fn vue_ts_maps_produces_typescript() {
         let options = TokenizeOptions::new(Mode::Mild);
         let maps = tokenize_sfc_maps(VUE_TS_FILE, "vue", &options);
@@ -491,5 +556,23 @@ const x: number = 5;
         );
         assert!(formats.contains(&"css"), "must have real css block");
         assert!(formats.contains(&"html"), "must have html markup");
+    }
+
+    #[test]
+    fn astro_frontmatter_closes_at_a_fence_from_the_first_column() {
+        // A `---` inside a template string is no fence: Astro and basta close
+        // the frontmatter only at a line that starts with it.
+        let source = "---\nconst help = `\n  ---\n`;\nfunction summarize(total: number) {\n  return total + 1;\n}\n---\n<p>{help}</p>\n";
+        let maps = tokenize_sfc_maps(source, "astro", &TokenizeOptions::new(Mode::Mild));
+        let script = maps
+            .iter()
+            .find(|m| m.format == "typescript")
+            .expect("the frontmatter");
+        let texts: Vec<&str> = script
+            .tokens
+            .iter()
+            .map(|t| &source[t.range[0]..t.range[1]])
+            .collect();
+        assert!(texts.contains(&"summarize"), "{texts:?}");
     }
 }

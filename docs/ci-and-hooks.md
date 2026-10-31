@@ -23,7 +23,7 @@ jobs:
 
 This scans the entire repository with default settings and uploads SARIF results to GitHub Code Scanning.
 
-`@v5` is a moving tag that follows the latest 5.x release of the action. Pin to an exact tag (e.g. `kucherenko/jscpd@v5.1.2`) or a commit SHA if you need reproducible runs.
+`@v5` is a moving tag that follows the latest 5.x release of the action. Pin to an exact release tag (e.g. `kucherenko/jscpd@v5.4.2`) or its commit SHA if you need reproducible runs, and see [Pin a specific version](#pin-a-specific-version) for the jscpd release it installs.
 
 ### Fail on Threshold
 
@@ -52,10 +52,13 @@ The workflow fails if more than 5% of the code is duplicated.
 | `ignore-pattern` | Comma-separated regex patterns to skip | — |
 | `reporters` | Comma-separated reporters | `console` |
 | `output` | Output directory for file reporters | `report` |
+| `report-name` | Base name of the report files (`--report-name`); the action reads `<report-name>.json` and `.sarif` back, so set it here when `.jscpd.json` sets `reportName` | `jscpd-report` |
 | `threshold` | Max duplication % before exit 1 | — |
 | `baseline` | Path to a clone baseline file; clones absent from it are reported as new | — |
 | `update-baseline` | Rewrite the baseline file from the current run (requires `baseline`) | `false` |
 | `fail-on-new-clones` | Exit 1 on new clones (`true`, or an integer N to allow up to N) | — |
+| `fail-on-empty` | Exit 1 when the scan analyzes no files (paths exist but nothing matched the filters) | `false` |
+| `history` | Duplication and health trend over git history: `true` for the last 30 commits of the branch, or for the `history` range of the config file when it has one; a range of commits to scan (e.g. `v5.0.0..HEAD`); `false` leaves it off. Prints charts and a table in the log (needs the commits fetched: `fetch-depth: 0`, or `30` for `true`) | — |
 | `baseline-from-ref` | Compare against an ephemeral baseline built from a git ref (needs `fetch-depth: 0`) | — |
 | `blame` | Enrich clones with git blame data | `false` |
 | `exit-code` | Exit with code when duplicates found (`true` or integer) | — |
@@ -63,13 +66,19 @@ The workflow fails if more than 5% of the code is duplicated.
 | `max-size` | Skip files larger than SIZE | — |
 | `skip-local` | Skip clones in same directory | `false` |
 | `ignore-case` | Ignore case of symbols (experimental) | `false` |
+| `ignore-identifiers` | Treat identifiers as equal (Type-2 clones): `consistent` lets a name stand for one name on the other side only, `blind` any name match any other, in `similarity` too, `true` takes the matching from the config's `ignoreIdentifiers`, else `consistent` | `false` |
+| `ignore-literals` | Treat all string and numeric literals as equal | `false` |
+| `ignore-annotations` | Skip annotations and decorators (`@Name`, `@Name(...)`) | `false` |
+| `max-gap-lines` | Merge clones separated by at most N unmatched lines into one near-miss clone (Type-3); `0` disables | `0` |
+| `similarity` | Report pairs of functions whose normalized syntax trees share at least this ratio of subtrees, a number in `(0, 1]` such as `0.8` | config, else off |
+| `min-nodes` | The fewest nodes of a normalized syntax tree a function needs for `similarity` to compare it | config, else `20` |
 | `follow-symlinks` | Follow symbolic links | `false` |
 | `no-gitignore` | Don't respect .gitignore files | `false` |
 | `absolute` | Use absolute paths in reports | `false` |
 | `formats-exts` | Custom format-to-extension mappings | — |
 | `formats-names` | Custom format-to-filename mappings | — |
-| `version` | jscpd version to install | `latest` |
-| `install-prefix` | Installation directory for the binary | — |
+| `version` | jscpd version to install: empty installs the release the action ref belongs to, `latest` the newest release | the action's release |
+| `install-prefix` | Installation directory for the binary on Linux/macOS (Windows installs it with npm) | `~/.local/bin` |
 | `skip-install` | Skip installation (binary already present) | `false` |
 | `extra-args` | Additional arguments passed to jscpd | — |
 | `upload-report` | Upload report directory as artifact | `false` |
@@ -121,10 +130,16 @@ The workflow fails if more than 5% of the code is duplicated.
 
 #### Pin a specific version
 
+By default the action installs the jscpd release its ref belongs to, so pinning the action to a release tag or its commit SHA pins jscpd too, and a Dependabot or Renovate bump of the action updates both. This starts with the first release after 5.4.2: v5.4.2 and older tags install the newest jscpd.
+
+A commit between releases installs the release before it, so pin a release rather than a commit on `master`. While a release is being published, `@master` already names the new version, and the action installs the latest release with a warning until the new one is out.
+
+Set `version` to install another release, or `latest` for the newest one:
+
 ```yaml
 - uses: kucherenko/jscpd@v5
   with:
-    version: "5.1.2"
+    version: "5.4.2"
 ```
 
 #### Skip install (binary already in image)
@@ -162,6 +177,68 @@ Existing clones are tolerated; the job fails only when the pull request introduc
     echo "Found ${{ steps.jscpd.outputs.clones-found }} clones"
 ```
 
+## Using jscpd with Super Linter
+
+[Super Linter](https://github.com/super-linter/super-linter) runs jscpd as `jscpd --config <rules>/.jscpd.json` over the whole workspace. The config file lives in the linter rules folder, `.github/linters/.jscpd.json` by default (`LINTER_RULES_PATH`, file name `JSCPD_CONFIG_FILE`). Every key of the [config file](rust.md#config-file) works there, including `threshold`, `ignore`, `ignorePattern`, `baseline`, `baselineFromRef` and `failOnNewClones`, so there is no need to pass flags.
+
+The baseline keys arrived in jscpd 5.1.0, so the two recipes below need Super Linter v9.0.0 or later, which ships jscpd 5.3.0. v8.7.0 ships jscpd 5.0.10: it prints `unknown field 'baseline'` for each of the keys and runs without the gate, so the job passes whatever the change adds. v8.0.0 to v8.6.0 run jscpd 4.x.
+
+When the repository has no such file, Super Linter uses its bundled one, which sets `"threshold": 0`. That fails the build on any duplication at all, including clones that were there long before the change, which is why many projects end up with `VALIDATE_JSCPD: false`. Commit a config of your own and gate on *new* clones instead, with one of the two recipes below. Leave `threshold` out of it, or the old clones fail the build as before.
+
+`VALIDATE_ALL_CODEBASE: false` does not narrow the scan: jscpd needs the whole tree to find clones.
+
+### Committed baseline
+
+For a repository that already has duplication, record the clones it has now and fail only on clones that are not in the record. `.github/linters/.jscpd.json`:
+
+```json
+{
+  "reporters": ["consoleFull"],
+  "ignore": ["**/__snapshots__/**"],
+  "absolute": true,
+  "baseline": ".jscpd-baseline.json",
+  "failOnNewClones": 0
+}
+```
+
+A relative `baseline` is resolved against the folder of the config file, so this one is `.github/linters/.jscpd-baseline.json`. Create it once, locally (jscpd 5.1.0 or later), and commit it next to the config:
+
+```bash
+jscpd --config .github/linters/.jscpd.json --update-baseline .
+git add .github/linters/.jscpd-baseline.json
+```
+
+The file holds a content fingerprint per clone and no paths, so a baseline made on a laptop matches in the Super Linter container. Until it is committed, the run stops with `baseline file … not found — run with --update-baseline to create it`.
+
+Super Linter then passes while the clones stay the ones in the file and fails with `ERROR: jscpd found N new clones not in the baseline (allowed: 0)` when a change adds one. Run the same command again to accept clones on purpose, for example after a refactoring removed some. Raise `failOnNewClones` to tolerate a few new clones per run.
+
+### Changed code only
+
+To compare each run with the base branch instead of a committed file, use `baselineFromRef`:
+
+```json
+{
+  "reporters": ["consoleFull"],
+  "ignore": ["**/__snapshots__/**"],
+  "absolute": true,
+  "baselineFromRef": "origin/main",
+  "failOnNewClones": 0
+}
+```
+
+Put the default branch of the repository in place of `main`. jscpd scans the tree of that ref with the same configuration and fails only on clones it does not find there, so there is no file to keep up to date. The ref has to be in the checkout, otherwise jscpd stops with `git ref 'origin/main' not found`; Super Linter already asks for the full history:
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+- uses: super-linter/super-linter@v9
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+It costs a second scan of the repository, and on a push to `main` itself every clone is in the base, so the check passes. See [Baseline](rust.md#baseline) for how clones are matched.
+
 ## Docker
 
 A multi-arch image (`linux/amd64`, `linux/arm64`) built from the release binaries is published to GitHub Container Registry on every release. It contains only the static `jscpd` binary, so it is suitable for any CI system that can run containers:
@@ -177,7 +254,7 @@ docker run --rm -v "$PWD:/src" ghcr.io/kucherenko/jscpd:5 --threshold 5 --report
 docker run --rm -v "$PWD:/src" ghcr.io/kucherenko/jscpd --reporters json,html --output report .
 ```
 
-The working directory inside the container is `/src`. Tags: `latest`, `5`, `5.1`, `5.1.2` (major, minor, and exact version). The image contains only the static binary — `--blame` and `--baseline-from-ref` need `git`, which is not included. On Linux hosts, add `--user "$(id -u):$(id -g)"` so report files are owned by you rather than root.
+The working directory inside the container is `/src`. Tags: `latest`, `5`, `5.4`, `5.4.2` (major, minor, and exact version). The image contains only the static binary — `--blame` and `--baseline-from-ref` need `git`, which is not included. On Linux hosts, add `--user "$(id -u):$(id -g)"` so report files are owned by you rather than root.
 
 GitLab CI example, using the Code Quality and metrics reporters:
 
@@ -233,7 +310,23 @@ repos:
         always_run: true
 ```
 
-**Option B: `language: system`** — jscpd must be pre-installed globally:
+**Option B: `language: python`** — pre-commit installs the [PyPI wheel](https://pypi.org/project/jscpd/) (the same prebuilt binary), so no Node.js is needed on the machine. Pin the version so every contributor gets the same binary:
+
+```yaml
+repos:
+  - repo: local
+    hooks:
+      - id: jscpd
+        name: jscpd - copy/paste detector
+        entry: jscpd
+        language: python
+        additional_dependencies: ['jscpd==5.4.2']
+        args: [--threshold, "5", --reporters, console,silent]
+        pass_filenames: false
+        always_run: true
+```
+
+**Option C: `language: system`** — jscpd must be pre-installed globally:
 
 ```yaml
 repos:
@@ -248,7 +341,7 @@ repos:
         always_run: true
 ```
 
-If using Option B, install jscpd globally first: `npm install -g jscpd` or `cargo install jscpd`.
+If using Option C, install jscpd globally first: `npm install -g jscpd`, `pip install jscpd` or `cargo install jscpd`.
 
 **3. Install the hook into git:**
 
@@ -263,6 +356,16 @@ To run manually without committing:
 ```bash
 pre-commit run jscpd --all-files
 ```
+
+### Only the files you changed
+
+A hook that scans the whole repository also fails on duplication that was there before your change. `--changed` reports only the clones of the files `git status` lists, and `--fail-on-new-clones` fails only on the ones HEAD didn't have:
+
+```bash
+jscpd --changed --fail-on-new-clones --reporters console .
+```
+
+The first run saves the clones of HEAD to `.jscpd-baseline.json`, and the first run after a commit builds it again. Add the file to `.gitignore`. See [Changed files](rust.md#changed-files).
 
 ### Using Husky
 

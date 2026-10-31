@@ -11,13 +11,21 @@ const packageJson = JSON.parse(
 const npmVersion = packageJson.version;
 
 const subCrates = [
-  { dir: "crates/cpd-core", version: "0.1.11" },
-  { dir: "crates/cpd-tokenizer", version: "0.1.13" },
-  { dir: "crates/cpd-finder", version: "0.1.14" },
-  { dir: "crates/cpd-reporter", version: "0.1.12" },
+  { dir: "crates/cpd-core", version: "0.1.22" },
+  { dir: "crates/cpd-tokenizer", version: "0.1.21" },
+  { dir: "crates/cpd-similarity", version: "0.1.1" },
+  { dir: "crates/cpd-finder", version: "0.1.22" },
+  { dir: "crates/cpd-reporter", version: "0.1.23" },
+  { dir: "crates/cpd-semantic", version: "0.1.3" },
+  { dir: "crates/basta", version: "0.3.2" },
 ];
 
 const mainCrate = { dir: "crates/cpd", version: npmVersion };
+
+// basta ships on its own cadence: its crate version is the single source of
+// truth for the npm wrapper and its platform packages alike, so a jscpd
+// release never drags basta's version along and vice versa.
+const bastaVersion = subCrates.find((c) => c.dir === "crates/basta").version;
 
 const subCrateVersions = {};
 for (const { dir, version } of subCrates) {
@@ -136,31 +144,77 @@ console.log(`Version sync complete: npm=${npmVersion}, sub-crates=${JSON.stringi
   }
 }
 
-// Sync the repository-root package.json. It is a private package whose only
-// job is to make `pre-commit` (language: node, see .pre-commit-hooks.yaml)
-// install the `jscpd` binary when a project points its hook at this repo, so
-// its `version` and its exact `jscpd` dependency pin follow the engine version.
+// Sync the basta wrapper package version and its platform pins, against the
+// basta crate version rather than the jscpd release version. Version and pins
+// are set independently for the same reason the jscpd block does it: anything
+// that sets one without the other ships a wrapper resolving the wrong engine.
 {
-  const rootPkgPath = path.join(root, "..", "package.json");
-  const rootPkg = JSON.parse(fs.readFileSync(rootPkgPath, "utf8"));
+  const bastaPkgPath = path.join(root, "basta", "package.json");
+  const bastaPkg = JSON.parse(fs.readFileSync(bastaPkgPath, "utf8"));
   let changed = false;
 
-  if (rootPkg.version !== npmVersion) {
-    rootPkg.version = npmVersion;
+  if (bastaPkg.version !== bastaVersion) {
+    bastaPkg.version = bastaVersion;
     changed = true;
   }
-  rootPkg.dependencies ??= {};
-  if (rootPkg.dependencies.jscpd !== npmVersion) {
-    rootPkg.dependencies.jscpd = npmVersion;
-    changed = true;
+
+  for (const [dep, version] of Object.entries(bastaPkg.optionalDependencies || {})) {
+    if (version !== bastaVersion) {
+      bastaPkg.optionalDependencies[dep] = bastaVersion;
+      changed = true;
+    }
   }
 
   if (changed) {
-    fs.writeFileSync(rootPkgPath, `${JSON.stringify(rootPkg, null, 2)}\n`);
-    console.log(`Updated ../package.json to ${npmVersion}`);
+    fs.writeFileSync(bastaPkgPath, `${JSON.stringify(bastaPkg, null, 2)}\n`);
+    console.log(`Updated basta/package.json to ${bastaVersion}`);
   } else {
-    console.log(`No change ../package.json (${npmVersion})`);
+    console.log(`No change basta/package.json (${bastaVersion})`);
   }
+}
+
+// PyPI needs PEP 440 versions: 5.3.0-beta.1 -> 5.3.0b1 (alpha/beta/rc only).
+// Mirrors `pep440()` in build-pypi-wheels.py; keep the two in step. Anything
+// else throws rather than guessing, since a wrong mapping would pin the
+// pre-commit hook to a version that never reaches PyPI.
+function toPep440(version) {
+  const m = /^(\d+\.\d+\.\d+)(?:-(alpha|beta|rc)\.?(\d+))?$/.exec(version);
+  if (!m) throw new Error(`cannot map version ${version} to PEP 440`);
+  const [, base, kind, num] = m;
+  return kind ? `${base}${{ alpha: "a", beta: "b", rc: "rc" }[kind]}${num}` : base;
+}
+const pypiVersion = toPep440(npmVersion);
+
+// Sync CITATION.cff: `version` follows the engine version, and `date-released`
+// is set to today's UTC date whenever the version changes, so a release commit
+// carries the right citation metadata without a manual edit.
+{
+  const citationPath = path.join(root, "..", "CITATION.cff");
+  const citation = fs.readFileSync(citationPath, "utf8");
+  const current = /^version: (.*)$/m.exec(citation)?.[1];
+  if (current !== npmVersion) {
+    const today = new Date().toISOString().slice(0, 10);
+    const updated = citation
+      .replace(/^version: .*$/m, `version: ${npmVersion}`)
+      .replace(/^date-released: .*$/m, `date-released: ${today}`);
+    fs.writeFileSync(citationPath, updated);
+    console.log(`Updated ../CITATION.cff to ${npmVersion} (released ${today})`);
+  } else {
+    console.log(`No change ../CITATION.cff (${npmVersion})`);
+  }
+}
+
+// Sync the repository-root pyproject.toml. It is a private project whose only
+// job is to make `pre-commit` (language: python, see .pre-commit-hooks.yaml)
+// install the `jscpd` binary from PyPI when a project points its hook at this
+// repo, so its `version` and its exact `jscpd` pin follow the engine version.
+{
+  const pyprojectPath = path.join(root, "..", "pyproject.toml");
+  const changed = updateCargoToml(pyprojectPath, [
+    [/^version = ".*"$/m, `version = "${pypiVersion}"`],
+    [/^dependencies = \["jscpd==[^"]*"\]$/m, `dependencies = ["jscpd==${pypiVersion}"]`],
+  ]);
+  console.log(`${changed ? "Updated" : "No change"} ../pyproject.toml to ${pypiVersion}`);
 }
 
 // Fail loudly rather than shipping a wrapper that resolves the wrong engine.
@@ -178,12 +232,42 @@ console.log(`Version sync complete: npm=${npmVersion}, sub-crates=${JSON.stringi
     }
   }
   {
-    const rootPkg = JSON.parse(fs.readFileSync(path.join(root, "..", "package.json"), "utf8"));
-    if (rootPkg.version !== npmVersion) {
-      problems.push(`../package.json: version is ${rootPkg.version}, expected ${npmVersion}`);
+    const citation = fs.readFileSync(path.join(root, "..", "CITATION.cff"), "utf8");
+    const version = /^version: (.*)$/m.exec(citation)?.[1];
+    if (version !== npmVersion) {
+      problems.push(`../CITATION.cff: version is ${version}, expected ${npmVersion}`);
     }
-    if (rootPkg.dependencies?.jscpd !== npmVersion) {
-      problems.push(`../package.json: jscpd pinned to ${rootPkg.dependencies?.jscpd}, expected ${npmVersion}`);
+  }
+  {
+    const pyproject = fs.readFileSync(path.join(root, "..", "pyproject.toml"), "utf8");
+    const version = /^version = "([^"]*)"$/m.exec(pyproject)?.[1];
+    if (version !== pypiVersion) {
+      problems.push(`../pyproject.toml: version is ${version}, expected ${pypiVersion}`);
+    }
+    const pin = /^dependencies = \["jscpd==([^"]*)"\]$/m.exec(pyproject)?.[1];
+    if (pin !== pypiVersion) {
+      problems.push(`../pyproject.toml: jscpd pinned to ${pin}, expected ${pypiVersion}`);
+    }
+  }
+  {
+    const pkg = JSON.parse(
+      fs.readFileSync(path.join(root, "basta", "package.json"), "utf8"),
+    );
+    if (pkg.version !== bastaVersion) {
+      problems.push(`basta/package.json: version is ${pkg.version}, expected ${bastaVersion}`);
+    }
+    for (const [dep, version] of Object.entries(pkg.optionalDependencies || {})) {
+      if (version !== bastaVersion) {
+        problems.push(`basta/package.json: ${dep} pinned to ${version}, expected ${bastaVersion}`);
+      }
+    }
+    const targets = JSON.parse(
+      fs.readFileSync(path.join(root, "npm", "prebuilt-targets.json"), "utf8"),
+    );
+    for (const key of Object.keys(targets)) {
+      if (!(`basta-${key}` in (pkg.optionalDependencies || {}))) {
+        problems.push(`basta/package.json: no optional dependency for platform ${key}`);
+      }
     }
   }
   if (problems.length > 0) {
@@ -192,4 +276,5 @@ console.log(`Version sync complete: npm=${npmVersion}, sub-crates=${JSON.stringi
     process.exit(1);
   }
   console.log(`Verified npm package versions and platform pins are all ${npmVersion}`);
+  console.log(`Verified basta wrapper and platform pins are all ${bastaVersion}`);
 }

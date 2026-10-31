@@ -41,6 +41,7 @@ impl Reporter for ThresholdReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::fixtures::report_result;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -52,11 +53,8 @@ mod tests {
         let mut opts = ReporterOptions::new(PathBuf::from("/tmp"));
         opts.threshold = threshold;
         let reporter = ThresholdReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &stats_with_pct(pct, pct as u64),
-            duration: Duration::ZERO,
-            summary: None,
-        };
+        let stats = stats_with_pct(pct, pct as u64);
+        let ctx = ReportContext::new(&stats, Duration::ZERO);
         reporter.report(&[], &ctx, &PathBuf::from("/tmp"))
     }
 
@@ -91,28 +89,14 @@ mod tests {
 
     #[test]
     fn threshold_ok_with_no_threshold_set() {
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        let reporter = ThresholdReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &stats_with_pct(99.9, 99),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[], &ctx, &PathBuf::from("/tmp"));
+        let result = report_result(&stats_with_pct(99.9, 99), |_| {}, ThresholdReporter::new);
         assert!(result.is_ok(), "no threshold must always return Ok");
     }
 
     #[test]
     fn silent_always_ok() {
         use crate::silent::SilentReporter;
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        let reporter = SilentReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &stats_with_pct(100.0, 100),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[], &ctx, &PathBuf::from("/tmp"));
+        let result = report_result(&stats_with_pct(100.0, 100), |_| {}, SilentReporter::new);
         assert!(result.is_ok(), "silent reporter must always return Ok");
     }
 }

@@ -27,6 +27,27 @@ println!("Analyzed {} files", result.statistics.total.sources);
 
 A complete, runnable version is in [`examples/rust-cpd-finder`](../examples/rust-cpd-finder).
 
+Semantic clones come from the `cpd-semantic` crate, which adds a clone pass to the run:
+
+```rust
+use cpd_finder::orchestrate::{RunConfig, run};
+use cpd_semantic::{SemanticOptions, SemanticPass};
+use std::sync::Arc;
+
+// The local model is downloaded once, e.g. with `jscpd --semantic-download`.
+let options = SemanticOptions::default();
+let paths = vec!["./src".into()];
+let embedder = cpd_semantic::embedder(&options, &paths, true)?;
+// The thresholds of the rules, on the scale of the options' model.
+let thresholds = options.thresholds();
+let config = RunConfig {
+    paths,
+    passes: vec![Arc::new(SemanticPass::new(embedder, thresholds, options.scope))],
+    ..Default::default()
+};
+let result = run(&config)?;
+```
+
 The `jscpd` crate's own library target is **not a public API** — it exists to share helpers with the crate's tests and may change in any release. Depend on the engine crates instead.
 
 ### Crate Architecture
@@ -35,8 +56,10 @@ The `jscpd` crate's own library target is **not a public API** — it exists to 
 |-------|-------------|
 | [`cpd-core`](https://crates.io/crates/cpd-core) | Core data models and hashing (Rabin-Karp rolling hash) |
 | [`cpd-tokenizer`](https://crates.io/crates/cpd-tokenizer) | Source code tokenization (224 formats, uses `oxc_parser` for JavaScript/TypeScript) — pure, no I/O |
+| [`cpd-similarity`](https://crates.io/crates/cpd-similarity) | Structural similarity (`--similarity`): functions from tree-sitter syntax trees and a Clojure reader, the subtree fingerprints of their normalized trees and the exact search for pairs; pure, no I/O |
 | [`cpd-finder`](https://crates.io/crates/cpd-finder) | File walking, orchestration, git blame (`rayon` + `ignore` + `globset`) |
 | [`cpd-reporter`](https://crates.io/crates/cpd-reporter) | Output format rendering (15 reporters) |
+| [`cpd-semantic`](https://crates.io/crates/cpd-semantic) | Semantic clones (`--semantic`, experimental), as a clone pass for `cpd-finder` |
 
 See [Packages](./packages.md) for versions and paths.
 

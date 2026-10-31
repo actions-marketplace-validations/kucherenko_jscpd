@@ -77,13 +77,13 @@ jobs:
           toolchain: "1.97.1"
 
       - name: Cache Cargo registry and target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: "rust -> rust/target"
           cache-on-failure: true
 
       - name: Install Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           package-manager-cache: false
@@ -92,7 +92,7 @@ jobs:
         run: node scripts/sync-version.mjs
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: nextest
 
@@ -109,7 +109,7 @@ jobs:
 
       - name: Test Report
         if: always()
-        uses: dorny/test-reporter@a43b3a5f7366b97d083190328d2c652e1a8b6aa2 # v3.0.0
+        uses: dorny/test-reporter@d1b5dff021aa968b288b02285a8bf47471c5928a # v3.2.0
         with:
           name: Rust Tests (crates-publish)
           path: rust/target/nextest/ci/nextest.xml
@@ -132,14 +132,22 @@ jobs:
 
       - name: Authenticate to crates.io (Trusted Publishing)
         id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
 
       - name: Publish crates in dependency order
         working-directory: rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          # Discover workspace members in topological order (dependencies first)
+          # Discover workspace members in topological order (dependencies first).
+          #
+          # `basta` releases from github.com/kucherenko/basta, on its own
+          # trigger, and is deliberately not part of the jscpd release. It
+          # still appears here because `jscpd` depends on it, and cargo
+          # refuses to publish a crate whose dependency is not on crates.io
+          # — so a jscpd release must be able to put a missing basta there
+          # first. The version check below makes that a no-op whenever
+          # basta is already published, which is the normal case.
           ORDER=$(cargo metadata --format-version 1 --no-deps 2>/dev/null | node -e "
           const meta = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
           const wsPkgs = meta.packages.filter(p => !p.id.includes('fuzz'));
@@ -183,9 +191,41 @@ jobs:
               continue
             fi
 
-            if ! cargo publish --locked -p "${crate}" --allow-dirty; then
-              echo "⚠ Publish failed for ${crate}@${crate_version} (may already exist); continuing"
-              continue
+            # crates.io serves its index through a CDN that can lag behind the
+            # API: a crate published a minute ago may not resolve yet as a
+            # dependency of the next one, even after the wait below (5.4.0
+            # stopped on cpd-semantic that way). Only that error is retried.
+            published=false
+            for attempt in $(seq 1 10); do
+              if cargo publish --locked -p "${crate}" --allow-dirty 2>&1 | tee "$RUNNER_TEMP/publish.log"; then
+                published=true
+                break
+              fi
+              if grep -q "failed to select a version" "$RUNNER_TEMP/publish.log"; then
+                echo "A dependency of ${crate} is not in the crates.io index yet; retrying in 30 s (attempt ${attempt}/10)"
+                sleep 30
+                continue
+              fi
+              break
+            done
+
+            if [ "$published" != true ]; then
+              # Another run may have published it in the meantime; anything
+              # else is a real failure. Continuing would only make every
+              # crate that depends on this one fail too, and the job would
+              # still end green with crates.io a release behind (5.3.3).
+              max_ver=$(curl -sfH "Accept: application/json" -H "User-Agent: jscpd-ci (github.com/kucherenko/jscpd)" "https://crates.io/api/v1/crates/${crate}" 2>/dev/null \
+                | jq -r '.crate.max_version // empty' || echo "")
+              if [ "$max_ver" = "$crate_version" ]; then
+                echo "${crate}@${crate_version} is on crates.io after all (max_version=${max_ver}); continuing"
+                continue
+              fi
+              if [ -z "$max_ver" ]; then
+                echo "::error::${crate} does not exist on crates.io yet. Trusted publishing cannot create a crate: publish ${crate}@${crate_version} once with a token (cargo publish -p ${crate}), add this repository as its trusted publisher on crates.io, then rerun this job."
+              else
+                echo "::error::cargo publish failed for ${crate}@${crate_version} (crates.io has ${max_ver})"
+              fi
+              exit 1
             fi
 
             echo "Waiting for crates.io index to update for ${crate}@${crate_version}..."

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use cpd_core::hash::hash_token;
-use cpd_core::models::{DetectionToken, Token, TokenKind};
+use cpd_core::models::{DetectionToken, MEMBER_NAME, Token, TokenKind};
 
 use crate::markdown::tokens_to_detection;
 
@@ -57,6 +57,16 @@ pub struct TokenizeOptions {
     /// and code-level regex matches from `ignorePattern`.
     /// Each entry is `[start_byte, end_byte)`.
     pub ignore_ranges: Vec<[usize; 2]>,
+    /// Hash every identifier as `$id` so clones that differ only in variable,
+    /// function or type names match (issue #998). Keywords are kept: the
+    /// JavaScript tokenizer classifies them, other languages fall back to
+    /// [`is_common_keyword`].
+    pub ignore_identifiers: bool,
+    /// Hash string literals as `$str` and numeric literals as `$num`.
+    pub ignore_literals: bool,
+    /// Drop `@Name`, `@a.b.Name` and `@Name(...)` annotation/decorator
+    /// sequences before hashing, in formats listed by [`strips_annotations`].
+    pub ignore_annotations: bool,
     /// Pre-compiled code-level regex patterns inherited from v4 `ignorePattern`.
     /// Before tokenization, these are matched against the source text and
     /// overlapping byte ranges are added to `ignore_ranges`.
@@ -73,24 +83,11 @@ impl TokenizeOptions {
         Self {
             mode,
             ignore_case: false,
+            ignore_identifiers: false,
+            ignore_literals: false,
+            ignore_annotations: false,
             ignore_ranges: Vec::new(),
             code_ignore_regexes: Vec::new(),
-            strip_types_formats: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Build TokenizeOptions with pre-compiled regex patterns from string patterns.
-    /// Invalid regex patterns are silently skipped.
-    pub fn with_code_ignore_patterns(mode: Mode, patterns: &[String]) -> Self {
-        let code_ignore_regexes: Vec<regex::Regex> = patterns
-            .iter()
-            .filter_map(|p| regex::Regex::new(p).ok())
-            .collect();
-        Self {
-            mode,
-            ignore_case: false,
-            ignore_ranges: Vec::new(),
-            code_ignore_regexes,
             strip_types_formats: std::collections::HashSet::new(),
         }
     }
@@ -117,7 +114,48 @@ pub fn tokenize_format_to_detection(
         "markdown" | "md" => crate::generic::tokenize_generic(source, format),
         _ => crate::generic::tokenize_generic(source, format),
     };
-    tokens_to_detection(raw, options)
+    tokens_to_detection(raw, options, NameRules::of(format))
+}
+
+/// [`tokenize_format_to_detection`] for the block of a host file that
+/// starts at byte `offset`, such as a Markdown fence or a component's
+/// script: the host's `ignore_ranges` apply at the block's own offsets.
+pub fn tokenize_block_to_detection(
+    format: &str,
+    block: &str,
+    offset: usize,
+    options: &TokenizeOptions,
+) -> Vec<DetectionToken> {
+    if options.ignore_ranges.is_empty() {
+        return tokenize_format_to_detection(format, block, options);
+    }
+    // The expressions are spent: their ranges are all a block needs.
+    let local = TokenizeOptions {
+        mode: options.mode,
+        ignore_case: options.ignore_case,
+        ignore_ranges: ranges_in(&options.ignore_ranges, offset..offset + block.len()),
+        ignore_identifiers: options.ignore_identifiers,
+        ignore_literals: options.ignore_literals,
+        ignore_annotations: options.ignore_annotations,
+        code_ignore_regexes: Vec::new(),
+        strip_types_formats: options.strip_types_formats.clone(),
+    };
+    tokenize_format_to_detection(format, block, &local)
+}
+
+/// The parts of a host file's byte ranges `ranges` that fall in its block
+/// `block`, by the block's own offsets.
+pub fn ranges_in(ranges: &[[usize; 2]], block: std::ops::Range<usize>) -> Vec<[usize; 2]> {
+    ranges
+        .iter()
+        .filter(|[start, end]| *start < block.end && *end > block.start)
+        .map(|[start, end]| {
+            [
+                (*start).max(block.start) - block.start,
+                (*end).min(block.end) - block.start,
+            ]
+        })
+        .collect()
 }
 
 /// True when this format's TypeScript-only syntax must be stripped for
@@ -160,10 +198,12 @@ pub fn push_token(
     start: cpd_core::models::Location,
     end: cpd_core::models::Location,
     options: &TokenizeOptions,
-) {
+    fold_names: bool,
+    member: bool,
+) -> bool {
     // Drop Ignore-marked tokens in all modes.
     if kind == TokenKind::Ignore {
-        return;
+        return false;
     }
     // Drop tokens in Ignore byte ranges.
     // This covers both jscpd:ignore-start/end markers and code-level ignorePattern
@@ -173,13 +213,13 @@ pub fn push_token(
         .iter()
         .any(|[rs, re]| byte_start < *re && byte_end > *rs)
     {
-        return;
+        return false;
     }
     // Mode-based filtering:
     match options.mode {
         Mode::Mild => {
             if kind == TokenKind::Whitespace {
-                return;
+                return false;
             }
         }
         Mode::Weak => {
@@ -187,17 +227,553 @@ pub fn push_token(
                 kind,
                 TokenKind::Whitespace | TokenKind::Comment | TokenKind::BlockComment
             ) {
-                return;
+                return false;
             }
         }
         Mode::Strict => {} // keep everything (except Ignore, handled above)
     }
+    let raw_hash = hash_token(kind.discriminant(), value, options.ignore_case);
+    let (hash, name) = match normalized_value(&kind, value, options) {
+        Some(placeholder) => {
+            // The language decides whether a name keeps its case, whatever
+            // --ignore-case says, and a member is another name than a local
+            // of its text; 0 marks the tokens that are not renamed
+            // identifiers.
+            let name = match placeholder {
+                RENAMED_IDENTIFIER => {
+                    let name = match fold_names == options.ignore_case {
+                        true => raw_hash,
+                        false => hash_token(kind.discriminant(), value, fold_names),
+                    };
+                    match member {
+                        true => name | MEMBER_NAME,
+                        false => (name & !MEMBER_NAME).max(1),
+                    }
+                }
+                _ => 0,
+            };
+            (hash_token(kind.discriminant(), placeholder, false), name)
+        }
+        None => (raw_hash, 0),
+    };
     tokens.push(DetectionToken {
-        hash: hash_token(kind.discriminant(), value, options.ignore_case),
+        hash,
+        raw_hash,
+        name,
         start,
         end,
         range: [byte_start, byte_end],
     });
+    true
+}
+
+/// Whether the names of `format` ignore case, so that `Customer` and
+/// `customer` are one name to consistent matching.
+pub fn names_ignore_case(format: &str) -> bool {
+    matches!(
+        format,
+        "abap"
+            | "ada"
+            | "apex"
+            | "autohotkey"
+            | "autoit"
+            | "basic"
+            | "batch"
+            | "cfml"
+            | "cfscript"
+            | "cobol"
+            | "excel-formula"
+            | "fortran"
+            | "ichigojam"
+            | "pascal"
+            | "plsql"
+            | "powershell"
+            | "sas"
+            | "sql"
+            | "vbnet"
+            | "vhdl"
+            | "visual-basic"
+            | "xojo"
+    )
+}
+
+/// How the names of a format compare when `--ignore-identifiers` matches
+/// them consistently (see [`DetectionToken::name`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NameRules {
+    /// `Customer` and `customer` are one name ([`names_ignore_case`]).
+    pub fold_case: bool,
+    /// A name after `.` is a member, another name than a local of the same
+    /// text: `this.url = url` copied as `this.url = link` pairs each name
+    /// with one name.
+    pub members: bool,
+    /// A name after `->` is a member, as in C, C++ and PHP.
+    pub arrows: bool,
+}
+
+impl NameRules {
+    /// The rules of `format`: `.` reaches a member in the languages of
+    /// [`DOT_MEMBERS`], `->` in those of [`ARROW_MEMBERS`]. In other formats
+    /// a name after them is a name like any other: PHP and Perl join
+    /// strings with `.`, Fortran compares with `.gt.`, Haskell composes
+    /// functions, and prose ends a sentence.
+    pub fn of(format: &str) -> Self {
+        Self {
+            fold_case: names_ignore_case(format),
+            members: DOT_MEMBERS.contains(&format),
+            arrows: ARROW_MEMBERS.contains(&format),
+        }
+    }
+}
+
+/// The formats where `.` reaches a member of what comes before it.
+const DOT_MEMBERS: &[&str] = &[
+    "actionscript",
+    "apex",
+    "arduino",
+    "bison",
+    "c",
+    "c-header",
+    "cfscript",
+    "clike",
+    "coffeescript",
+    "cpp",
+    "cpp-header",
+    "crystal",
+    "csharp",
+    "d",
+    "dart",
+    "flow",
+    "fsharp",
+    "gdscript",
+    "glsl",
+    "go",
+    "groovy",
+    "haxe",
+    "hlsl",
+    "java",
+    "javascript",
+    "jsx",
+    "julia",
+    "kotlin",
+    "livescript",
+    "lua",
+    "n4js",
+    "nim",
+    "objectivec",
+    "ocaml",
+    "odin",
+    "opencl",
+    "powershell",
+    "processing",
+    "python",
+    "reason",
+    "rescript",
+    "ruby",
+    "rust",
+    "scala",
+    "solidity",
+    "swift",
+    "tsx",
+    "typescript",
+    "unrealscript",
+    "vala",
+    "vbnet",
+    "visual-basic",
+    "wgsl",
+    "xojo",
+    "zig",
+];
+
+/// The formats where `->` reaches a member of what comes before it.
+const ARROW_MEMBERS: &[&str] = &[
+    "arduino",
+    "bison",
+    "c",
+    "c-header",
+    "clike",
+    "cpp",
+    "cpp-header",
+    "objectivec",
+    "opencl",
+    "perl",
+    "php",
+];
+
+/// Whether each name of a token stream is reached as a member, by the
+/// [`NameRules`] of its format: after a single `.` or `?.` (most tokenizers
+/// give `..` and `...`, ranges, spreads, varargs and Dart's cascades, as one
+/// dot after another), after the `.` that ends a number such as Rust's
+/// `x.0.url`, or after `->` given as `-` and `>`, but not `-->`. The tokens
+/// it is shown are the ones detection keeps, without comments.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MemberAccess {
+    rules: NameRules,
+    /// The last three tokens shown, oldest first: what each is and where it
+    /// starts and ends.
+    last: [(Access, usize, usize); 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Dot,
+    /// A number that a single dot ends, as `0.` in `x.0.url`.
+    NumberDot,
+    Minus,
+    Greater,
+    Other,
+}
+
+impl MemberAccess {
+    pub(crate) fn new(rules: NameRules) -> Self {
+        Self {
+            rules,
+            last: [(Access::Other, 0, 0); 3],
+        }
+    }
+
+    /// Whether the rules can make any name a member's.
+    pub(crate) fn tracks(&self) -> bool {
+        self.rules.members || self.rules.arrows
+    }
+
+    /// Whether a name that comes next is a member's.
+    pub(crate) fn next_is_member(&self) -> bool {
+        let [
+            (oldest, _, oldest_end),
+            (older, older_start, older_end),
+            (newer, newer_start, _),
+        ] = self.last;
+        match newer {
+            Access::Dot => {
+                self.rules.members && !(older == Access::Dot && older_end == newer_start)
+            }
+            Access::NumberDot => self.rules.members,
+            Access::Greater => {
+                self.rules.arrows
+                    && older == Access::Minus
+                    && older_end == newer_start
+                    && !(oldest == Access::Minus && oldest_end == older_start)
+            }
+            Access::Minus | Access::Other => false,
+        }
+    }
+
+    /// Takes in the token `value` at `start..end`.
+    pub(crate) fn see(&mut self, value: &str, start: usize, end: usize) {
+        let access = match value {
+            "." | "?." => Access::Dot,
+            "-" => Access::Minus,
+            ">" => Access::Greater,
+            _ if value.ends_with('.')
+                && !value.ends_with("..")
+                && value.starts_with(|c: char| c.is_ascii_digit()) =>
+            {
+                Access::NumberDot
+            }
+            _ => Access::Other,
+        };
+        self.last = [self.last[1], self.last[2], (access, start, end)];
+    }
+}
+
+/// The detection tokens of `raw`, the tokens of a source whose names compare
+/// by `rules`. A token that `annotation` marks is a dropped annotation: its
+/// text goes into the raw hash of the token before it. A clone whose
+/// matched run contains that token then classifies as `renamed` when the
+/// annotations differ, while a run that starts after the annotation is
+/// unaffected and stays `exact`: the reported fragment text really is
+/// identical there.
+pub(crate) fn detection_tokens(
+    raw: Vec<Token>,
+    options: &TokenizeOptions,
+    rules: NameRules,
+    annotation: &[bool],
+) -> Vec<DetectionToken> {
+    let mut members = MemberAccess::new(rules);
+    let track = options.ignore_identifiers && members.tracks();
+    let mut detection: Vec<DetectionToken> = Vec::with_capacity(raw.len());
+    for (i, t) in raw.into_iter().enumerate() {
+        if annotation.get(i).copied().unwrap_or(false) {
+            if let Some(prev) = detection.last_mut() {
+                let h = hash_token(t.kind.discriminant(), &t.value, false);
+                prev.raw_hash = prev.raw_hash.rotate_left(7) ^ h;
+            }
+            continue;
+        }
+        let byte_start = t.start.offset as usize;
+        let byte_end = t.end.offset as usize;
+        let comment = matches!(t.kind, TokenKind::Comment | TokenKind::BlockComment);
+        let member = track && members.next_is_member();
+        let kept = push_token(
+            &mut detection,
+            t.kind,
+            &t.value,
+            byte_start,
+            byte_end,
+            t.start,
+            t.end,
+            options,
+            rules.fold_case,
+            member,
+        );
+        if track && kept && !comment {
+            members.see(&t.value, byte_start, byte_end);
+        }
+    }
+    detection
+}
+
+/// The placeholder every identifier hashes as under `--ignore-identifiers`.
+const RENAMED_IDENTIFIER: &str = "$id";
+
+/// Placeholder that replaces `value` under the active normalization options,
+/// or `None` when the token hashes as-is (issue #998).
+#[inline]
+fn normalized_value(
+    kind: &TokenKind,
+    value: &str,
+    options: &TokenizeOptions,
+) -> Option<&'static str> {
+    match kind {
+        TokenKind::Identifier if options.ignore_identifiers => {
+            if is_common_keyword(value) {
+                None
+            } else {
+                Some(RENAMED_IDENTIFIER)
+            }
+        }
+        TokenKind::Literal if options.ignore_literals => literal_placeholder(value),
+        _ => None,
+    }
+}
+
+/// `$str` for quoted literals (with an optional short alphabetic prefix such
+/// as Python's `r"..."` or C#'s `@"..."`), `$num` for numbers, `None` for
+/// anything else (`true`, `null`, regex literals) which keeps its own hash.
+fn literal_placeholder(value: &str) -> Option<&'static str> {
+    let bytes = value.as_bytes();
+    let first = *bytes.first()?;
+    if matches!(first, b'"' | b'\'' | b'`') {
+        return Some("$str");
+    }
+    if first.is_ascii_digit() {
+        return Some("$num");
+    }
+    if first == b'.' && bytes.get(1).is_some_and(u8::is_ascii_digit) {
+        return Some("$num");
+    }
+    if first.is_ascii_alphabetic() || first == b'@' {
+        let quote_at = bytes
+            .iter()
+            .take(4)
+            .position(|b| matches!(b, b'"' | b'\'' | b'`'));
+        if quote_at.is_some() {
+            return Some("$str");
+        }
+    }
+    None
+}
+
+/// Keywords the generic tokenizer reports as identifiers. Kept verbatim under
+/// `--ignore-identifiers` so control flow still has to match; the list is the
+/// union of common keywords across C-like, Python-like and ML-like languages.
+/// Must stay sorted: looked up by binary search.
+static COMMON_KEYWORDS: &[&str] = &[
+    "abstract",
+    "and",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "begin",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "default",
+    "defer",
+    "del",
+    "do",
+    "elif",
+    "else",
+    "elsif",
+    "end",
+    "enum",
+    "except",
+    "export",
+    "extends",
+    "extern",
+    "false",
+    "final",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "from",
+    "func",
+    "function",
+    "global",
+    "go",
+    "goto",
+    "if",
+    "impl",
+    "implements",
+    "import",
+    "in",
+    "inline",
+    "instanceof",
+    "interface",
+    "is",
+    "lambda",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "module",
+    "mut",
+    "namespace",
+    "new",
+    "nil",
+    "none",
+    "not",
+    "null",
+    "or",
+    "override",
+    "package",
+    "pass",
+    "private",
+    "protected",
+    "pub",
+    "public",
+    "raise",
+    "record",
+    "ref",
+    "require",
+    "rescue",
+    "return",
+    "sealed",
+    "select",
+    "self",
+    "sizeof",
+    "static",
+    "struct",
+    "super",
+    "switch",
+    "then",
+    "this",
+    "throw",
+    "throws",
+    "trait",
+    "true",
+    "try",
+    "type",
+    "typedef",
+    "typeof",
+    "undefined",
+    "union",
+    "unless",
+    "unsafe",
+    "until",
+    "use",
+    "using",
+    "var",
+    "virtual",
+    "void",
+    "volatile",
+    "when",
+    "where",
+    "while",
+    "with",
+    "yield",
+];
+
+/// True for words in [`COMMON_KEYWORDS`] (case-sensitive).
+pub fn is_common_keyword(word: &str) -> bool {
+    COMMON_KEYWORDS.binary_search(&word).is_ok()
+}
+
+/// Formats where `@Name` / `@Name(...)` means an annotation or decorator.
+/// Elsewhere (`Ruby`, `Perl`, `T-SQL`, `Razor`, `CSS`) `@` prefixes variables
+/// or directives and must not be dropped.
+pub fn strips_annotations(format: &str) -> bool {
+    matches!(
+        format,
+        "javascript"
+            | "typescript"
+            | "jsx"
+            | "tsx"
+            | "java"
+            | "kotlin"
+            | "scala"
+            | "groovy"
+            | "python"
+            | "dart"
+            | "swift"
+    )
+}
+
+/// Flag `@Name`, `@a.b.Name` and `@Name(...)` token runs so the detection
+/// path drops them (issue #998). Whitespace tokens inside a run are tolerated
+/// only between the name and its argument list. Returns one flag per token,
+/// or an empty vector when nothing matched.
+fn mark_annotations(tokens: &[Token]) -> Vec<bool> {
+    let n = tokens.len();
+    let mut i = 0;
+    let mut flags: Vec<bool> = Vec::new();
+    while i < n {
+        // `@` followed by an identifier — but never by a keyword: Java's
+        // `@interface Name { … }` declares an annotation type rather than
+        // applying one, and the generic tokenizer reports `interface` as an
+        // identifier.
+        let starts_annotation = tokens[i].value == "@"
+            && tokens[i].kind != TokenKind::Ignore
+            && tokens
+                .get(i + 1)
+                .is_some_and(|t| t.kind == TokenKind::Identifier && !is_common_keyword(&t.value));
+        if !starts_annotation {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut j = i + 2;
+        while j + 1 < n && tokens[j].value == "." && tokens[j + 1].kind == TokenKind::Identifier {
+            j += 2;
+        }
+        let mut k = j;
+        while k < n && tokens[k].kind == TokenKind::Whitespace {
+            k += 1;
+        }
+        if k < n && tokens[k].value == "(" {
+            let mut depth = 0usize;
+            j = k;
+            while j < n {
+                match tokens[j].value.as_str() {
+                    "(" => depth += 1,
+                    ")" => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        if flags.is_empty() {
+            flags = vec![false; n];
+        }
+        for flag in &mut flags[start..j] {
+            *flag = true;
+        }
+        i = j;
+    }
+    flags
 }
 
 /// Tokenize source code in the given format with the given mode.
@@ -252,22 +828,79 @@ pub fn tokenize_to_detection(
     } else {
         dispatch_tokenizer(format, source, options.mode)
     };
-    let mut detection = Vec::with_capacity(raw.len());
-    for t in raw {
-        let byte_start = t.start.offset as usize;
-        let byte_end = t.end.offset as usize;
-        push_token(
-            &mut detection,
-            t.kind,
-            &t.value,
-            byte_start,
-            byte_end,
-            t.start,
-            t.end,
-            options,
-        );
+    let annotation = if options.ignore_annotations && strips_annotations(format) {
+        mark_annotations(&raw)
+    } else {
+        Vec::new()
+    };
+    detection_tokens(raw, options, NameRules::of(format), &annotation)
+}
+
+/// The byte ranges of `source` whose tokens the tokenizer of `format` drops
+/// for `jscpd:ignore-start` and `jscpd:ignore-end` markers, sorted and
+/// disjoint, so the code inside a range is left out of detection. Each
+/// language reads the markers as its tokenizer does: the container formats
+/// run their tokenizer, the others scan the text. Empty without a marker.
+pub fn ignored_ranges(format: &str, source: &str) -> Vec<[usize; 2]> {
+    if !source.contains("jscpd:ignore") {
+        return Vec::new();
     }
-    detection
+    let ranges = match format {
+        "javascript" | "typescript" | "jsx" | "tsx" => {
+            crate::javascript::find_ignore_ranges(source)
+        }
+        "markdown" | "md" => crate::markdown::collect_ignore_byte_ranges(source),
+        "vue" | "svelte" | "astro" | "razor" => ignored_tokens(format, source),
+        _ => crate::generic::ignore_line_ranges(source),
+    };
+    merge_ranges(ranges)
+}
+
+/// The byte ranges of the tokens the tokenizer of a container format marks
+/// as ignored, one per run of them: blanks and comments between ignored
+/// tokens keep a run whole.
+fn ignored_tokens(format: &str, source: &str) -> Vec<[usize; 2]> {
+    let mut ranges = Vec::new();
+    let mut open: Option<[usize; 2]> = None;
+    for token in dispatch_tokenizer(format, source, Mode::Mild) {
+        match token.kind {
+            TokenKind::Ignore => {
+                let (start, end) = (token.start.offset as usize, token.end.offset as usize);
+                match &mut open {
+                    Some(range) => range[1] = end,
+                    None => open = Some([start, end]),
+                }
+            }
+            TokenKind::Whitespace | TokenKind::Comment | TokenKind::BlockComment => {}
+            _ => ranges.extend(open.take()),
+        }
+    }
+    ranges.extend(open);
+    ranges
+}
+
+/// `ranges` sorted and merged where they overlap or touch, without the
+/// empty ones.
+pub fn merge_ranges(mut ranges: Vec<[usize; 2]>) -> Vec<[usize; 2]> {
+    ranges.retain(|[start, end]| start < end);
+    ranges.sort_unstable();
+    let mut merged: Vec<[usize; 2]> = Vec::with_capacity(ranges.len());
+    for [start, end] in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last[1] => last[1] = last[1].max(end),
+            _ => merged.push([start, end]),
+        }
+    }
+    merged
+}
+
+/// The `--ignore-pattern` expressions that compile; the others are
+/// skipped, as a warning says when the run starts.
+pub fn compile_ignore_patterns(patterns: &[String]) -> Vec<regex::Regex> {
+    patterns
+        .iter()
+        .filter_map(|pattern| regex::Regex::new(pattern).ok())
+        .collect()
 }
 
 fn dispatch_tokenizer(format: &str, source: &str, mode: Mode) -> Vec<Token> {
@@ -314,6 +947,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignore_patterns_drop_the_code_they_match_inside_a_markdown_fence() {
+        let md = "# Guide\n\nSome prose first.\n\n```js\nfunction total(items) {\n  let sum = 0;\n  console.log(\"start\");\n  for (const item of items) sum += item.price;\n  return sum;\n}\n```\n";
+        let re = regex::Regex::new(r"console\.log\(.*\);").unwrap();
+        let options = TokenizeOptions {
+            ignore_ranges: code_ignore_ranges(md, &[re]),
+            ..TokenizeOptions::new(Mode::Mild)
+        };
+        let maps = tokenize_to_detection_maps("markdown", md, &options);
+        let js = maps.iter().find(|map| map.format == "javascript").unwrap();
+        let texts: Vec<&str> = js
+            .tokens
+            .iter()
+            .map(|t| &md[t.range[0]..t.range[1]])
+            .collect();
+        assert!(!texts.contains(&"console"), "{texts:?}");
+        assert!(texts.contains(&"return"), "{texts:?}");
+        assert_eq!(
+            ranges_in(&[[2, 8], [20, 30]], 5..25),
+            vec![[0, 3], [15, 20]]
+        );
+    }
+
+    #[test]
+    fn ignored_ranges_hold_what_the_tokenizers_drop_and_nothing_else() {
+        let sources = [
+            (
+                "python",
+                "a = 1\n# jscpd:ignore-start\nb = 2\n# jscpd:ignore-end\nc = 3\n",
+            ),
+            ("python", "a = 1\nb = close(a)  # jscpd:ignore-end\nc = 3\n"),
+            ("python", "x = 1  # jscpd:ignore-start\ny = 2\n"),
+            (
+                "python",
+                "a = 1\n# jscpd:ignore-start jscpd:ignore-end\nb = 2\n",
+            ),
+            (
+                "python",
+                "a = 1\r\n# jscpd:ignore-start\r\nb = 2\r\n# jscpd:ignore-end\r\nc = 3\r\n",
+            ),
+            (
+                "javascript",
+                "let a = 1;\n// jscpd:ignore-start\nlet b = 2;\n/* jscpd:ignore-end */ let c = 3;\n",
+            ),
+            (
+                "javascript",
+                "let a = 1;\n// jscpd:ignore-start\nlet b = 2;\n",
+            ),
+            (
+                "typescript",
+                "const a = 1; /* jscpd:ignore-start */ const b = 2; /* jscpd:ignore-end */ const c = 3;\n",
+            ),
+        ];
+        for (format, source) in sources {
+            let ranges = ignored_ranges(format, source);
+            let all = tokenize(format, source, Mode::Strict);
+            let kept = dispatch_tokenizer(format, source, Mode::Strict);
+            for token in &kept {
+                let (start, end) = (token.start.offset as usize, token.end.offset as usize);
+                let inside = ranges.iter().any(|[s, e]| *s <= start && end <= *e);
+                let overlaps = ranges.iter().any(|[s, e]| start < *e && end > *s);
+                match token.kind {
+                    TokenKind::Ignore => {
+                        assert!(inside, "{format} {source:?}: {token:?} in {ranges:?}")
+                    }
+                    TokenKind::Whitespace | TokenKind::Comment | TokenKind::BlockComment => {}
+                    _ => assert!(!overlaps, "{format} {source:?}: {token:?} in {ranges:?}"),
+                }
+            }
+            // A token the tokenizer drops without a trace lies in a range too.
+            for (at, _) in source.match_indices("close") {
+                let dropped = !all.iter().any(|t| t.start.offset as usize == at);
+                if dropped {
+                    assert!(
+                        ranges.iter().any(|[s, e]| *s <= at && at < *e),
+                        "{source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ignore_patterns_drop_the_code_they_match_in_razor_and_vue_blocks() {
+        let pattern = regex::Regex::new(r"Log\.Debug\([^)]*\);").unwrap();
+        let razor = "<h1>@Model.Title</h1>\n<p>Totals</p>\n@{\n    var total = Model.Lines.Sum(l => l.Price);\n    Log.Debug(\"total computed\");\n    ViewData[\"Total\"] = total;\n}\n";
+        let options = TokenizeOptions {
+            ignore_ranges: code_ignore_ranges(razor, std::slice::from_ref(&pattern)),
+            ..TokenizeOptions::new(Mode::Mild)
+        };
+        let texts: Vec<&str> = tokenize_to_detection("razor", razor, &options)
+            .iter()
+            .map(|t| &razor[t.range[0]..t.range[1]])
+            .collect();
+        assert!(!texts.contains(&"Log"), "{texts:?}");
+        assert!(texts.contains(&"ViewData"), "{texts:?}");
+
+        let md = "# Guide\n\nA component:\n\n```vue\n<template><p>{{ total }}</p></template>\n<script>\nexport default {\n  computed: {\n    total() {\n      Log.Debug(\"total\");\n      return this.lines.length;\n    },\n  },\n};\n</script>\n```\n";
+        let options = TokenizeOptions {
+            ignore_ranges: code_ignore_ranges(md, std::slice::from_ref(&pattern)),
+            ..TokenizeOptions::new(Mode::Mild)
+        };
+        let maps = tokenize_to_detection_maps("markdown", md, &options);
+        let texts: Vec<&str> = maps
+            .iter()
+            .filter(|map| map.format != "markdown")
+            .flat_map(|map| map.tokens.iter())
+            .map(|t| &md[t.range[0]..t.range[1]])
+            .collect();
+        assert!(!texts.contains(&"Log"), "{texts:?}");
+        assert!(texts.contains(&"return"), "{texts:?}");
+    }
+
+    #[test]
+    fn ignored_ranges_cover_the_code_between_the_markers() {
+        let python = "def f(x):\n    y = x\n    # jscpd:ignore-start\n    for i in x:\n        # retry\n        y += i\n    # jscpd:ignore-end\n    return y\n";
+        let ranges = ignored_ranges("python", python);
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        let [start, end] = ranges[0];
+        let ignored = &python[start..end];
+        assert!(ignored.contains("for i in x:"), "{ignored:?}");
+        assert!(ignored.contains("y += i"), "{ignored:?}");
+        assert!(!ignored.contains("return"), "{ignored:?}");
+
+        let js = "function f(x) {\n  let y = x;\n  // jscpd:ignore-start\n  for (const i of x) { y += i; }\n  // jscpd:ignore-end\n  return y;\n}\n";
+        let ranges = ignored_ranges("javascript", js);
+        assert_eq!(ranges.len(), 1, "{ranges:?}");
+        let ignored = &js[ranges[0][0]..ranges[0][1]];
+        assert!(
+            ignored.contains("for (const i of x) { y += i; }"),
+            "{ignored:?}"
+        );
+        assert!(!ignored.contains("return"), "{ignored:?}");
+
+        assert!(ignored_ranges("python", "x = 1\n").is_empty());
+    }
+
+    #[test]
     fn mode_from_str_defaults_to_mild() {
         assert_eq!("unknown".parse::<Mode>().unwrap(), Mode::Mild);
         assert_eq!("mild".parse::<Mode>().unwrap(), Mode::Mild);
@@ -329,227 +1099,235 @@ mod tests {
         assert_eq!("strict".parse::<Mode>().unwrap(), Mode::Strict);
     }
 
+    fn det(source: &str, format: &str, opts: &TokenizeOptions) -> Vec<DetectionToken> {
+        tokenize_to_detection(format, source, opts)
+    }
+
+    fn hashes(tokens: &[DetectionToken]) -> Vec<u64> {
+        tokens.iter().map(|t| t.hash).collect()
+    }
+
     #[test]
-    fn tokenize_to_detection_returns_detection_tokens() {
+    fn default_options_keep_raw_hash_equal_to_hash() {
         let opts = TokenizeOptions::new(Mode::Mild);
-        let tokens = tokenize_to_detection("javascript", "function hello() { return 42; }", &opts);
-        assert!(
-            !tokens.is_empty(),
-            "must produce DetectionTokens for valid JS"
-        );
+        let tokens = det("function a(x) { return x + 1; }", "javascript", &opts);
+        assert!(!tokens.is_empty());
+        assert!(tokens.iter().all(|t| t.raw_hash == t.hash));
     }
 
     #[test]
-    fn tokenize_to_detection_mild_excludes_whitespace() {
-        let opts = TokenizeOptions::new(Mode::Mild);
-        // The raw tokenizer produces whitespace tokens; mild mode drops them.
-        // We verify by counting: detection output should have fewer tokens than
-        // a strict-mode tokenize which keeps whitespace.
-        let mild = tokenize_to_detection("javascript", "a b c", &opts);
-        let strict =
-            tokenize_to_detection("javascript", "a b c", &TokenizeOptions::new(Mode::Strict));
-        // Mild must not exceed strict count (whitespace removed).
-        // Note: JS tokenizer doesn't produce Whitespace kind for OXC tokens,
-        // but the contract is that push_token correctly drops them if present.
-        let _ = (mild, strict);
-    }
-
-    #[test]
-    fn push_token_drops_ignore_kind() {
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let opts = TokenizeOptions::new(Mode::Mild);
-        push_token(
-            &mut tokens,
-            TokenKind::Ignore,
-            "secret",
-            0,
-            6,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert!(tokens.is_empty(), "Ignore-kind tokens must be dropped");
-    }
-
-    #[test]
-    fn push_token_drops_whitespace_in_mild_mode() {
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let opts = TokenizeOptions::new(Mode::Mild);
-        push_token(
-            &mut tokens,
-            TokenKind::Whitespace,
-            " ",
-            0,
-            1,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert!(tokens.is_empty(), "Whitespace must be dropped in Mild mode");
-    }
-
-    #[test]
-    fn push_token_keeps_whitespace_in_strict_mode() {
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let opts = TokenizeOptions::new(Mode::Strict);
-        push_token(
-            &mut tokens,
-            TokenKind::Whitespace,
-            " ",
-            0,
-            1,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert_eq!(tokens.len(), 1, "Whitespace must be kept in Strict mode");
-    }
-
-    #[test]
-    fn push_token_drops_comment_in_weak_mode() {
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let opts = TokenizeOptions::new(Mode::Weak);
-        push_token(
-            &mut tokens,
-            TokenKind::Comment,
-            "// note",
-            0,
-            7,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert!(tokens.is_empty(), "Comment must be dropped in Weak mode");
-    }
-
-    #[test]
-    fn push_token_ignore_case_folds_hash() {
-        let mut t1 = Vec::new();
-        let mut t2 = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
+    fn ignore_identifiers_matches_renamed_code_and_keeps_keywords() {
         let mut opts = TokenizeOptions::new(Mode::Mild);
-        opts.ignore_case = true;
-        push_token(
-            &mut t1,
-            TokenKind::Identifier,
-            "Hello",
-            0,
-            5,
-            loc.clone(),
-            loc.clone(),
-            &opts,
-        );
-        push_token(
-            &mut t2,
-            TokenKind::Identifier,
-            "hello",
-            0,
-            5,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert_eq!(t1[0].hash, t2[0].hash, "ignore_case must fold case in hash");
-    }
-
-    #[test]
-    fn push_token_code_ignore_range_skips_overlapping_token() {
-        // Simulate: source = "foo// cpd-disable"
-        // regex "//\\s*cpd-disable" matches bytes 3..18
-        // Token "foo" is at 0..3 (no overlap -> kept)
-        // Token "// cpd-disable" is at 3..18 (overlaps -> skipped)
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let mut opts = TokenizeOptions::new(Mode::Mild);
-        // Pre-computed byte ranges from regex match on source text
-        opts.ignore_ranges = vec![[3, 18]];
-        push_token(
-            &mut tokens,
-            TokenKind::Identifier,
-            "foo",
-            0,
-            3,
-            loc.clone(),
-            loc.clone(),
-            &opts,
-        );
-        push_token(
-            &mut tokens,
-            TokenKind::Comment,
-            "// cpd-disable",
-            3,
-            18,
-            loc.clone(),
-            loc,
-            &opts,
-        );
-        assert_eq!(tokens.len(), 1, "only the non-matching token should remain");
-        assert_eq!(tokens[0].range, [0, 3]);
-    }
-
-    #[test]
-    fn push_token_code_ignore_range_no_overlap_keeps_all() {
-        // regex match at bytes 100..120 doesn't overlap tokens at 0..3, 3..6
-        let mut tokens = Vec::new();
-        let loc = cpd_core::models::Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let mut opts = TokenizeOptions::new(Mode::Mild);
-        opts.ignore_ranges = vec![[100, 120]];
-        push_token(
-            &mut tokens,
-            TokenKind::Identifier,
-            "foo",
-            0,
-            3,
-            loc.clone(),
-            loc.clone(),
-            &opts,
-        );
-        push_token(
-            &mut tokens,
-            TokenKind::Identifier,
-            "bar",
-            3,
-            6,
-            loc.clone(),
-            loc,
-            &opts,
-        );
+        opts.ignore_identifiers = true;
+        let a = det("function a(x) { return x + 1; }", "javascript", &opts);
+        let b = det("function b(y) { return y + 1; }", "javascript", &opts);
         assert_eq!(
-            tokens.len(),
-            2,
-            "both tokens should remain when range doesn't overlap"
+            hashes(&a),
+            hashes(&b),
+            "renamed identifiers must hash alike"
+        );
+        // raw hashes still differ where the names differ
+        assert_ne!(
+            a.iter().map(|t| t.raw_hash).collect::<Vec<_>>(),
+            b.iter().map(|t| t.raw_hash).collect::<Vec<_>>()
+        );
+        // keywords are not folded: `return` vs `throw` must stay distinct
+        let c = det("function a(x) { throw x + 1; }", "javascript", &opts);
+        assert_ne!(hashes(&a), hashes(&c));
+    }
+
+    /// The text and the name of every token of `code` that has a name.
+    fn names<'a>(code: &'a str, format: &str, opts: &TokenizeOptions) -> Vec<(&'a str, u64)> {
+        det(code, format, opts)
+            .iter()
+            .filter(|t| t.name != 0)
+            .map(|t| (&code[t.range[0]..t.range[1]], t.name))
+            .collect()
+    }
+
+    #[test]
+    fn renamed_identifiers_keep_their_names() {
+        // Consistent matching (issue #1217) pairs the names of two clones.
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_identifiers = true;
+        for (code, format) in [("a = b + a", "python"), ("let a = b + a;", "javascript")] {
+            let names = names(code, format, &opts);
+            let texts: Vec<&str> = names.iter().map(|(text, _)| *text).collect();
+            assert_eq!(texts, ["a", "b", "a"], "{format}: only identifiers");
+            assert_eq!(names[0].1, names[2].1, "{format}");
+            assert_ne!(names[0].1, names[1].1, "{format}");
+        }
+        opts.ignore_identifiers = false;
+        assert!(names("a = b + a", "python", &opts).is_empty());
+    }
+
+    #[test]
+    fn a_dropped_annotation_leaves_the_name_before_it_alone() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_identifiers = true;
+        opts.ignore_annotations = true;
+        let code = "def f(self):\n    return result\n@staticmethod\ndef g():\n    return result\n";
+        let tokens = det(code, "python", &opts);
+        let results: Vec<_> = tokens
+            .iter()
+            .filter(|t| &code[t.range[0]..t.range[1]] == "result")
+            .collect();
+        assert_eq!(results.len(), 2);
+        // The decorator salts the raw hash of the `result` before it.
+        assert_ne!(results[0].raw_hash, results[1].raw_hash);
+        assert_eq!(results[0].name, results[1].name);
+    }
+
+    #[test]
+    fn names_ignore_case_where_the_language_does() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_identifiers = true;
+        let sql = "SELECT Customer.Name FROM Customer WHERE customer.City = 1";
+        let customer: Vec<u64> = names(sql, "sql", &opts)
+            .into_iter()
+            .filter(|(text, _)| text.eq_ignore_ascii_case("customer"))
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(customer.len(), 3, "{customer:?}");
+        assert!(customer.iter().all(|&name| name == customer[0]));
+        let js = names("Customer = customer;", "javascript", &opts);
+        assert_ne!(js[0].1, js[1].1, "JavaScript names keep their case");
+        // --ignore-case compares tokens; it does not make two names one.
+        opts.ignore_case = true;
+        let js = names("Customer = customer;", "javascript", &opts);
+        assert_ne!(js[0].1, js[1].1, "with --ignore-case too");
+    }
+
+    #[test]
+    fn a_member_is_another_name_than_the_local_it_spells() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_identifiers = true;
+        let urls = |code: &str, format: &str| -> Vec<u64> {
+            names(code, format, &opts)
+                .into_iter()
+                .filter(|(text, _)| *text == "url")
+                .map(|(_, name)| name)
+                .collect()
+        };
+        // A member, the local, and a member again.
+        for (format, code) in [
+            ("javascript", "this.url = url; a?.url;"),
+            ("python", "self.url = url\nother.url\n"),
+            ("java", "this.url = url; that.url = 1;"),
+            ("kotlin", "this.url = url; a?.url"),
+            ("go", "s.url = url; t.url = 1"),
+            ("c", "p->url = url; q.url = 1;"),
+            ("arduino", "p->url = url; q.url = 1;"),
+            ("php", "<?php $this->url = $url; $o->url;"),
+            ("rust", "s.0.url = url; t.url = 1;"),
+        ] {
+            let urls = urls(code, format);
+            assert_eq!(urls.len(), 3, "{format}");
+            assert_ne!(urls[0], urls[1], "{format}");
+            assert_eq!(urls[0], urls[2], "{format}");
+        }
+        // Ranges, spreads, varargs, a Rust return type and prose.
+        for (format, code) in [
+            ("rust", "let r = url..url;"),
+            ("ruby", "r = (url...url)"),
+            ("javascript", "f(...url, url);"),
+            ("java", "void f(String... url) { g(url); }"),
+            ("rust", "fn f(url: u8) -> url { url }"),
+            ("markdown", "Read it. url\nurl"),
+            ("html", "<p>Read it. url url</p>"),
+            // `.` joins strings in PHP and compares in Fortran.
+            ("php", "<?php $a = $b . url($c) . url($d);"),
+            ("fortran", "if (a .gt. url) url = 1"),
+            // `i-- > url` written without spaces.
+            ("c", "while (i-->url) url++;"),
+        ] {
+            let urls = urls(code, format);
+            assert!(urls.len() >= 2, "{format}: {urls:?}");
+            assert!(urls.iter().all(|&name| name == urls[0]), "{format}: {code}");
+        }
+    }
+
+    #[test]
+    fn ignore_identifiers_keeps_common_keywords_in_generic_languages() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_identifiers = true;
+        let a = det("if x:\n    return y\n", "python", &opts);
+        let b = det("if p:\n    return q\n", "python", &opts);
+        let c = det("while x:\n    return y\n", "python", &opts);
+        assert_eq!(hashes(&a), hashes(&b));
+        assert_ne!(
+            hashes(&a),
+            hashes(&c),
+            "`if` and `while` are keywords, not identifiers"
+        );
+        assert!(is_common_keyword("return"));
+        assert!(!is_common_keyword("total"));
+    }
+
+    #[test]
+    fn ignore_literals_folds_strings_and_numbers_separately() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_literals = true;
+        let a = det("const a = 10; const b = 'x';", "javascript", &opts);
+        let b = det("const a = 25; const b = \"yy\";", "javascript", &opts);
+        assert_eq!(hashes(&a), hashes(&b));
+        let c = det("const a = 'ten'; const b = 'x';", "javascript", &opts);
+        assert_ne!(hashes(&a), hashes(&c), "a string is not a number");
+        // A leading-dot number, a prefixed string and a keyword literal.
+        let d = det("const a = .5; const b = 'x';", "javascript", &opts);
+        assert_eq!(hashes(&a), hashes(&d), ".5 is a number too");
+        let raw_a = det("p = r'one'\n", "python", &opts);
+        let raw_b = det("p = r\"two\"\n", "python", &opts);
+        assert_eq!(hashes(&raw_a), hashes(&raw_b), "a prefixed string folds");
+        let t = det("const a = true;", "javascript", &opts);
+        let f = det("const a = false;", "javascript", &opts);
+        assert_ne!(hashes(&t), hashes(&f), "true and false are not folded");
+    }
+
+    #[test]
+    fn ignore_annotations_drops_decorators_in_listed_formats_only() {
+        let mut opts = TokenizeOptions::new(Mode::Mild);
+        opts.ignore_annotations = true;
+        let plain = det("class A { m() { return 1; } }", "typescript", &opts);
+        let decorated = det(
+            "@Component({ selector: 'a' })\nclass A { @Input() m() { return 1; } }",
+            "typescript",
+            &opts,
+        );
+        assert_eq!(hashes(&plain), hashes(&decorated));
+        // the token before an inner annotation carries a salted raw hash
+        assert!(decorated.iter().any(|t| t.raw_hash != t.hash));
+
+        let java_a = det(
+            "class A {\n  @Override\n  int f() { return 1; }\n}",
+            "java",
+            &opts,
+        );
+        let java_b = det(
+            "class A {\n  @Deprecated\n  int f() { return 1; }\n}",
+            "java",
+            &opts,
+        );
+        assert_eq!(hashes(&java_a), hashes(&java_b));
+        assert_ne!(
+            java_a.iter().map(|t| t.raw_hash).collect::<Vec<_>>(),
+            java_b.iter().map(|t| t.raw_hash).collect::<Vec<_>>(),
+            "different annotations must leave different raw hashes"
+        );
+
+        // `@interface` declares an annotation type; it is not an annotation use
+        let decl = "public @interface Marker {\n  String value() default \"\";\n}";
+        let stripped = det(decl, "java", &opts);
+        let untouched = det(decl, "java", &TokenizeOptions::new(Mode::Mild));
+        assert_eq!(hashes(&stripped), hashes(&untouched));
+
+        // Ruby instance variables use `@` and must survive
+        let ruby = det("@count = 1", "ruby", &opts);
+        assert!(strips_annotations("kotlin"));
+        assert!(!strips_annotations("ruby"));
+        assert_eq!(
+            ruby.len(),
+            det("@count = 1", "ruby", &TokenizeOptions::new(Mode::Mild)).len()
         );
     }
 
@@ -577,42 +1355,6 @@ mod tests {
         let source = "function foo() {}";
         let ranges = code_ignore_ranges(source, &[]);
         assert!(ranges.is_empty(), "no regexes means no ranges");
-    }
-
-    #[test]
-    fn with_code_ignore_patterns_builds_regexes() {
-        let opts = TokenizeOptions::with_code_ignore_patterns(
-            Mode::Mild,
-            &["function".to_string(), r"//\s*cpd-disable".to_string()],
-        );
-        assert_eq!(opts.code_ignore_regexes.len(), 2);
-        assert!(opts.code_ignore_regexes[0].is_match("function"));
-        assert!(opts.code_ignore_regexes[1].is_match("// cpd-disable"));
-        assert!(!opts.code_ignore_regexes[1].is_match("function"));
-    }
-
-    #[test]
-    fn tokenize_to_detection_with_code_ignore_ranges_skips_imports() {
-        let source = "import * from 'lodash';\nconst x = 1;";
-        let regexes = vec![regex::Regex::new(r"import\s+\*\s+from").unwrap()];
-        let ranges = code_ignore_ranges(source, &regexes);
-        assert!(!ranges.is_empty(), "should find regex match in source");
-
-        let mut opts = TokenizeOptions::new(Mode::Mild);
-        opts.ignore_ranges = ranges;
-        let tokens = tokenize_to_detection("javascript", source, &opts);
-
-        // Tokens whose byte ranges overlap the import match should be skipped.
-        // "import" (0-6), "*" (7-8), "from" (9-13) should all be in range,
-        // but "const" (24-29) and "x" (30-31) etc should remain.
-        let has_const = tokens.iter().any(|t| {
-            // Check that tokens after the import line are still present
-            t.range[0] >= 24
-        });
-        assert!(
-            has_const,
-            "tokens after the import line should still be present"
-        );
     }
 
     #[test]

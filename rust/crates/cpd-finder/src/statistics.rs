@@ -4,22 +4,30 @@
 use cpd_core::models::{CpdClone, SourceFile, StatRow, Statistics};
 use std::collections::HashMap;
 
-pub fn compute(sources: &[SourceFile], clones: &[CpdClone]) -> Statistics {
-    let total_lines: u64 = sources
-        .iter()
-        .map(|f| f.tokens.iter().map(|t| t.start.line).max().unwrap_or(0) as u64)
-        .sum();
-    let total_tokens: u64 = sources.iter().map(|f| f.tokens.len() as u64).sum();
+/// Statistics of `sources` with `clones` found among them. The sources are
+/// read once, so a caller that keeps them in several places (a server's
+/// index holds them per file) passes an iterator instead of a copy.
+pub fn compute<'a>(
+    sources: impl IntoIterator<Item = &'a SourceFile>,
+    clones: &[CpdClone],
+) -> Statistics {
+    // Per-format stats, and the totals with them.
+    let mut formats: HashMap<String, StatRow> = HashMap::new();
+    let (mut total_sources, mut total_lines, mut total_tokens) = (0u64, 0u64, 0u64);
+    for source in sources {
+        let (lines, tokens) = (source.line_count(), source.tokens.len() as u64);
+        total_sources += 1;
+        total_lines += lines;
+        total_tokens += tokens;
+        let entry = formats.entry(source.format.clone()).or_default();
+        entry.sources += 1;
+        entry.tokens += tokens;
+        entry.lines += lines;
+    }
 
-    let duplicated_lines: u64 = clones
-        .iter()
-        .map(|c| {
-            c.fragment_a
-                .end
-                .line
-                .saturating_sub(c.fragment_a.start.line) as u64
-        })
-        .sum();
+    // Matched lines of the primary fragment; whatever its span covers without
+    // duplicating stays out of the percentage.
+    let duplicated_lines: u64 = clones.iter().map(CpdClone::matched_lines).sum();
     let duplicated_tokens: u64 = clones.iter().map(|c| c.token_count as u64).sum();
 
     let percentage = if total_lines > 0 {
@@ -33,28 +41,10 @@ pub fn compute(sources: &[SourceFile], clones: &[CpdClone]) -> Statistics {
         0.0
     };
 
-    // Per-format stats
-    let mut formats: HashMap<String, StatRow> = HashMap::new();
-    for source in sources {
-        let entry = formats.entry(source.format.clone()).or_default();
-        entry.sources += 1;
-        entry.tokens += source.tokens.len() as u64;
-        entry.lines += source
-            .tokens
-            .iter()
-            .map(|t| t.start.line)
-            .max()
-            .unwrap_or(0) as u64;
-    }
     for clone in clones {
         if let Some(entry) = formats.get_mut(&clone.format) {
             entry.clones += 1;
-            entry.duplicated_lines += clone
-                .fragment_a
-                .end
-                .line
-                .saturating_sub(clone.fragment_a.start.line)
-                as u64;
+            entry.duplicated_lines += clone.matched_lines();
             entry.duplicated_tokens += clone.token_count as u64;
         }
     }
@@ -83,7 +73,7 @@ pub fn compute(sources: &[SourceFile], clones: &[CpdClone]) -> Statistics {
         total: StatRow {
             lines: total_lines,
             tokens: total_tokens,
-            sources: sources.len() as u64,
+            sources: total_sources,
             clones: clones.len() as u64,
             duplicated_lines,
             duplicated_tokens,
@@ -130,9 +120,9 @@ mod tests {
     }
 
     fn make_clone(format: &str, start_line: u32, end_line: u32, tc: u32) -> CpdClone {
-        CpdClone {
-            format: format.to_string(),
-            fragment_a: Fragment {
+        CpdClone::exact(
+            format.to_string(),
+            Fragment {
                 source_id: "a.js".to_string(),
                 source_root: None,
                 start: loc(start_line),
@@ -140,7 +130,7 @@ mod tests {
                 range: [0, tc],
                 blame: None,
             },
-            fragment_b: Fragment {
+            Fragment {
                 source_id: "b.js".to_string(),
                 source_root: None,
                 start: loc(start_line),
@@ -148,9 +138,8 @@ mod tests {
                 range: [0, tc],
                 blame: None,
             },
-            token_count: tc,
-            is_new: false,
-        }
+            tc,
+        )
     }
 
     #[test]
@@ -182,8 +171,25 @@ mod tests {
         let stats = compute(&sources, &clones);
         assert_eq!(stats.total.clones, 1);
         assert_eq!(stats.total.duplicated_tokens, 50);
-        // 9 lines duplicated out of 200 total => 4.5%
-        assert!((stats.total.percentage - 4.5).abs() < 0.01);
+        // Lines 1 through 10 is ten lines, out of 200 total => 5%
+        assert_eq!(stats.total.duplicated_lines, 10);
+        assert!((stats.total.percentage - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn gap_lines_of_a_merged_clone_are_not_duplicated() {
+        let sources = vec![
+            make_source("a.js", "javascript", 100),
+            make_source("b.js", "javascript", 100),
+        ];
+        let mut merged = make_clone("javascript", 1, 15, 120);
+        merged.unmatched_lines = [2, 0];
+        let stats = compute(&sources, &[merged]);
+        assert_eq!(
+            stats.total.duplicated_lines, 13,
+            "15-line span minus 2 gap lines"
+        );
+        assert_eq!(stats.formats["javascript"].duplicated_lines, 13);
     }
 
     #[test]

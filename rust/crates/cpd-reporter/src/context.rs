@@ -1,4 +1,6 @@
-use cpd_core::models::Statistics;
+use cpd_core::boundaries::BoundaryReport;
+use cpd_core::history::History;
+use cpd_core::models::{CpdClone, Statistics};
 use cpd_core::summary::Summary;
 use std::time::Duration;
 
@@ -14,6 +16,14 @@ pub struct ReportContext<'a> {
     pub duration: Duration,
     /// Opt-in codebase summary (`--summary`); None when disabled.
     pub summary: Option<&'a Summary>,
+    /// Opt-in duplication trend over git history (`--history`); None when disabled.
+    pub history: Option<&'a History>,
+    /// Every pair `--similarity` found, most similar first, the ones the
+    /// clones cover included; empty without it.
+    pub similar: &'a [CpdClone],
+    /// What the boundary rules of the config file found; None without
+    /// rules.
+    pub boundaries: Option<&'a BoundaryReport>,
 }
 
 impl<'a> ReportContext<'a> {
@@ -23,12 +33,33 @@ impl<'a> ReportContext<'a> {
             stats,
             duration,
             summary: None,
+            history: None,
+            similar: &[],
+            boundaries: None,
         }
     }
 
     /// Attach an opt-in codebase summary.
     pub fn with_summary(mut self, summary: Option<&'a Summary>) -> Self {
         self.summary = summary;
+        self
+    }
+
+    /// Attach an opt-in history series.
+    pub fn with_history(mut self, history: Option<&'a History>) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Attach every pair `--similarity` found.
+    pub fn with_similar(mut self, similar: &'a [CpdClone]) -> Self {
+        self.similar = similar;
+        self
+    }
+
+    /// Attach what the boundary rules found.
+    pub fn with_boundaries(mut self, boundaries: Option<&'a BoundaryReport>) -> Self {
+        self.boundaries = boundaries;
         self
     }
 }

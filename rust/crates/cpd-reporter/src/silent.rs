@@ -39,12 +39,9 @@ impl Reporter for SilentReporter {
 mod tests {
     use super::*;
     use crate::assert_reporter_name;
-    use crate::context::ReportContext;
-    use crate::reporter::ReporterOptions;
+    use crate::shared::fixtures::report_result;
     use cpd_core::models::{StatRow, Statistics};
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::time::Duration;
 
     fn any_stats() -> Statistics {
         Statistics {
@@ -68,43 +65,6 @@ mod tests {
 
     #[test]
     fn silent_always_ok_with_high_duplication() {
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        let reporter = SilentReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &any_stats(),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[], &ctx, &PathBuf::from("/tmp"));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn silent_prints_summary() {
-        let mut opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        opts.no_colors = true;
-        let reporter = SilentReporter::new(&opts);
-        let stats = Statistics {
-            total: StatRow {
-                lines: 100,
-                tokens: 500,
-                sources: 5,
-                clones: 2,
-                duplicated_lines: 20,
-                duplicated_tokens: 100,
-                percentage: 20.0,
-                percentage_tokens: 20.0,
-                ..StatRow::default()
-            },
-            formats: HashMap::new(),
-            detection_date: "2026-01-01T00:00:00Z".to_string(),
-        };
-        let ctx = ReportContext {
-            stats: &stats,
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[], &ctx, &PathBuf::from("/tmp"));
-        assert!(result.is_ok());
+        assert!(report_result(&any_stats(), |_| {}, SilentReporter::new).is_ok());
     }
 }

@@ -2,6 +2,7 @@ use crate::context::ReportContext;
 use crate::reporter::{Reporter, ReporterError, ReporterOptions};
 use crate::shared::{Style, extract_lines, read_file_cached, write_report_file};
 use cpd_core::models::CpdClone;
+use cpd_finder::orchestrate::host_file;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
@@ -9,6 +10,8 @@ use std::path::Path;
 pub struct JsonReporter {
     blame: bool,
     style: Style,
+    /// `--report-name` with this report's extension.
+    file_name: String,
 }
 
 impl JsonReporter {
@@ -16,6 +19,7 @@ impl JsonReporter {
         Self {
             blame: opts.blame,
             style: Style::new(opts.no_colors),
+            file_name: opts.report_file("json"),
         }
     }
 }
@@ -28,7 +32,11 @@ fn location_to_json(loc: &cpd_core::models::Location) -> serde_json::Value {
     })
 }
 
-fn clone_to_dup(
+/// One entry of `duplicates` in `jscpd-report.json`. The language server
+/// (`--lsp`) answers `jscpd/clones` with the same entries. A side names the
+/// file to open: a clone in a Markdown code block or a component's script
+/// names the file that holds it, and the block's language is `format`.
+pub fn clone_to_dup(
     clone: &CpdClone,
     include_blame: bool,
     file_cache: &mut HashMap<String, String>,
@@ -48,19 +56,25 @@ fn clone_to_dup(
     );
 
     let mut first_file = json!({
-        "name": clone.fragment_a.source_id,
+        "name": host_file(&clone.fragment_a.source_id),
         "start": clone.fragment_a.start.line,
         "end": clone.fragment_a.end.line,
         "startLoc": location_to_json(&clone.fragment_a.start),
         "endLoc": location_to_json(&clone.fragment_a.end),
     });
     let mut second_file = json!({
-        "name": clone.fragment_b.source_id,
+        "name": host_file(&clone.fragment_b.source_id),
         "start": clone.fragment_b.start.line,
         "end": clone.fragment_b.end.line,
         "startLoc": location_to_json(&clone.fragment_b.start),
         "endLoc": location_to_json(&clone.fragment_b.end),
     });
+
+    // A `--similarity` pair: the size of each normalized tree.
+    if let Some(structure) = &clone.structure {
+        first_file["nodes"] = json!(structure.nodes[0]);
+        second_file["nodes"] = json!(structure.nodes[1]);
+    }
 
     if include_blame {
         if let Some(ref blame) = clone.fragment_a.blame {
@@ -77,7 +91,7 @@ fn clone_to_dup(
         }
     }
 
-    json!({
+    let mut duplicate = json!({
         "format": clone.format,
         "lines": lines,
         "fragment": fragment,
@@ -85,7 +99,21 @@ fn clone_to_dup(
         "firstFile": first_file,
         "secondFile": second_file,
         "isNew": clone.is_new,
-    })
+        "kind": clone.kind.as_str(),
+    });
+    add_near_miss(&mut duplicate, clone);
+    duplicate
+}
+
+/// The keys of a near-miss clone: its `similarity` and the `method` that
+/// found it. The MCP server writes them the same way.
+pub fn add_near_miss(value: &mut serde_json::Value, clone: &CpdClone) {
+    if let Some(similarity) = clone.similarity_rounded() {
+        value["similarity"] = json!(similarity);
+    }
+    if let Some(method) = clone.similarity_method {
+        value["method"] = json!(method.as_str());
+    }
 }
 
 impl Reporter for JsonReporter {
@@ -115,16 +143,19 @@ impl Reporter for JsonReporter {
             value["summary"] =
                 serde_json::to_value(summary).map_err(|e| ReporterError::Format(e.to_string()))?;
         }
+        // Same rule for --history: absent unless requested.
+        if let Some(history) = ctx.history {
+            value["history"] =
+                serde_json::to_value(history).map_err(|e| ReporterError::Format(e.to_string()))?;
+        }
+        // And for the boundary rules: absent unless the config has them.
+        if let Some(boundaries) = ctx.boundaries {
+            value["boundaries"] = crate::boundaries_render::boundaries_json(boundaries);
+        }
 
         let content = serde_json::to_string_pretty(&value)
             .map_err(|e| ReporterError::Format(e.to_string()))?;
-        write_report_file(
-            output_dir,
-            "jscpd-report.json",
-            &content,
-            &self.style,
-            "JSON",
-        )?;
+        write_report_file(output_dir, &self.file_name, &content, &self.style, "JSON")?;
         Ok(())
     }
 }
@@ -132,13 +163,11 @@ impl Reporter for JsonReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::ReportContext;
     use crate::reporter::ReporterOptions;
     use crate::shared::fixtures::{
-        empty_ctx, empty_stats, make_clone, make_clone_with_locations, tmp_dir,
+        empty_ctx, empty_stats, make_clone, make_clone_with_locations, report_to_file, tmp_dir,
     };
     use cpd_core::models::{BlameEntry, Location, Statistics};
-    use std::time::Duration;
 
     #[test]
     fn json_output_is_valid_json() {
@@ -154,13 +183,7 @@ mod tests {
     }
 
     fn run_json_report(clones: &[CpdClone], blame: bool) -> String {
-        let dir = tmp_dir("json");
-        let mut opts = ReporterOptions::new(dir.clone());
-        opts.blame = blame;
-        let reporter = JsonReporter::new(&opts);
-        let ctx = empty_ctx();
-        reporter.report(clones, &ctx, &dir).unwrap();
-        std::fs::read_to_string(dir.join("jscpd-report.json")).unwrap()
+        run_json_report_with_stats(clones, &empty_stats(), blame)
     }
 
     #[test]
@@ -173,6 +196,26 @@ mod tests {
         );
         assert!(content.contains("\"lines\""), "must include lines field");
         assert!(content.contains("\"tokens\""), "must include tokens field");
+    }
+
+    #[test]
+    fn json_names_the_file_that_holds_a_block() {
+        // A Markdown fence or a component's script is a source of its own,
+        // named after its file and its language.
+        let content = run_json_report(
+            &[make_clone(
+                "docs/guide.md:markup",
+                "src/App.vue:typescript",
+                42,
+            )],
+            false,
+        );
+        let parsed = parse_json_report(&content);
+        assert_eq!(
+            parsed["duplicates"][0]["firstFile"]["name"],
+            "docs/guide.md"
+        );
+        assert_eq!(parsed["duplicates"][0]["secondFile"]["name"], "src/App.vue");
     }
 
     #[test]
@@ -212,17 +255,14 @@ mod tests {
     }
 
     fn run_json_report_with_stats(clones: &[CpdClone], stats: &Statistics, blame: bool) -> String {
-        let dir = tmp_dir("json");
-        let mut opts = ReporterOptions::new(dir.clone());
-        opts.blame = blame;
-        let reporter = JsonReporter::new(&opts);
-        let ctx = ReportContext {
+        report_to_file(
+            "json",
+            "jscpd-report.json",
+            clones,
             stats,
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        reporter.report(clones, &ctx, &dir).unwrap();
-        std::fs::read_to_string(dir.join("jscpd-report.json")).unwrap()
+            |opts| opts.blame = blame,
+            JsonReporter::new,
+        )
     }
 
     fn parse_json_report(content: &str) -> serde_json::Value {
@@ -326,6 +366,33 @@ mod tests {
         let parsed = parse_json_report(&content);
         assert_eq!(parsed["duplicates"][0]["isNew"], true);
         assert_eq!(parsed["duplicates"][1]["isNew"], false);
+    }
+
+    #[test]
+    fn json_duplicate_includes_similarity_only_for_similar_clones() {
+        let mut similar = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        similar.kind = cpd_core::models::CloneKind::Similar;
+        similar.similarity = Some(0.851_063_8);
+        similar.similarity_method = Some(cpd_core::models::SimilarityMethod::Gap);
+        let exact = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        let content = run_json_report(&[similar, exact], false);
+        let parsed = parse_json_report(&content);
+        assert_eq!(parsed["duplicates"][0]["kind"], "similar");
+        assert_eq!(parsed["duplicates"][0]["similarity"], 0.851);
+        assert_eq!(parsed["duplicates"][0]["method"], "gap");
+        assert!(parsed["duplicates"][1].get("method").is_none());
+        assert!(parsed["duplicates"][1].get("similarity").is_none());
+    }
+
+    #[test]
+    fn json_duplicate_includes_kind() {
+        let mut renamed = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        renamed.kind = cpd_core::models::CloneKind::Renamed;
+        let exact = make_clone("nonexistent.js", "also_nonexistent.js", 10);
+        let content = run_json_report(&[renamed, exact], false);
+        let parsed = parse_json_report(&content);
+        assert_eq!(parsed["duplicates"][0]["kind"], "renamed");
+        assert_eq!(parsed["duplicates"][1]["kind"], "exact");
     }
 
     #[test]

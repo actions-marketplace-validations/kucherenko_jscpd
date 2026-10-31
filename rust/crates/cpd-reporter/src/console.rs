@@ -31,8 +31,11 @@ impl Reporter for ConsoleReporter {
     ) -> Result<(), ReporterError> {
         report_console_style(clones, ctx.stats, &self.style, BoxChars::ascii(), |clone| {
             let fa = &clone.fragment_a;
-            let lines = fa.end.line.saturating_sub(fa.start.line) + 1;
-            print_clone_header(&self.style, &clone.format, clone.is_new);
+            // What the statistics count, so the header and the table agree.
+            // For an embedded block that is the code itself, not the host
+            // text the span happens to reach across (issue #1090).
+            let lines = clone.matched_lines();
+            print_clone_header(&self.style, clone);
             println!(
                 " - {} [{}:{} - {}:{}] ({} lines, {} tokens)",
                 self.style.bold_green(&fa.source_id),
@@ -55,9 +58,7 @@ impl Reporter for ConsoleReporter {
                 )
             );
         });
-        if let Some(summary) = ctx.summary {
-            crate::summary_render::print_summary(summary, &self.style);
-        }
+        crate::shared::print_appendices(ctx, &self.style);
         Ok(())
     }
 }
@@ -66,42 +67,12 @@ impl Reporter for ConsoleReporter {
 mod tests {
     use super::*;
     use crate::assert_empty_report_ok;
-    use crate::context::ReportContext;
-    use crate::reporter::ReporterOptions;
-    use crate::shared::fixtures::{empty_ctx, make_clone, one_clone_stats};
     use std::path::PathBuf;
-    use std::time::Duration;
+
+    // What the console reporter prints is checked on real stdout in
+    // tests/console_output.rs.
 
     assert_empty_report_ok!(empty_clones_does_not_panic, ConsoleReporter);
-
-    #[test]
-    fn non_empty_clones_does_not_panic() {
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        let reporter = ConsoleReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &one_clone_stats(),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        assert!(
-            reporter
-                .report(
-                    &[make_clone("src/a.js", "src/b.js", 50)],
-                    &ctx,
-                    &PathBuf::from("/tmp")
-                )
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn no_colors_flag_respected() {
-        let mut opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        opts.no_colors = true;
-        let reporter = ConsoleReporter::new(&opts);
-        let ctx = empty_ctx();
-        assert!(reporter.report(&[], &ctx, &PathBuf::from("/tmp")).is_ok());
-    }
 
     #[test]
     fn name_returns_console() {

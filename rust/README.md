@@ -28,6 +28,17 @@ cargo binstall jscpd
 
 Installs both `jscpd` and `cpd` binaries.
 
+### PyPI
+
+Platform wheels carrying the same prebuilt binary, for Python toolchains and [pre-commit](../docs/ci-and-hooks.md#pre-commit-hook) hooks that should not need Node.js:
+
+```bash
+pip install jscpd          # or: pipx install jscpd / uv tool install jscpd
+uvx jscpd /path/to/code    # run without installing
+```
+
+Installs both `jscpd` and `cpd` commands.
+
 ### Nix
 
 ```bash
@@ -62,7 +73,9 @@ jscpd . --blame --reporters console-full
 jscpd . --reporters json,html
 jscpd . --threshold 10
 jscpd --baseline-from-ref origin/main --fail-on-new-clones .
+jscpd --changed .
 jscpd --mcp .
+jscpd --lsp
 jscpd --list
 ```
 
@@ -83,6 +96,7 @@ jscpd/cpd (CLI binary)
 | [`cpd-tokenizer`](https://crates.io/crates/cpd-tokenizer) | Language tokenization (224 formats); pure, no I/O |
 | [`cpd-finder`](https://crates.io/crates/cpd-finder) | File walking, orchestration, git blame |
 | [`cpd-reporter`](https://crates.io/crates/cpd-reporter) | Output formatting (15 reporters) |
+| [`cpd-semantic`](https://crates.io/crates/cpd-semantic) | Semantic clones (`--semantic`): function extraction, code embeddings, pairing |
 
 Current versions are in each crate's `Cargo.toml`; `scripts/sync-version.mjs` keeps them and the npm packages in step. The workspace layout, npm launcher packages and platform packages are described in [docs/packages.md](../docs/packages.md).
 
@@ -106,7 +120,7 @@ See [docs/api.md](../docs/api.md) and [examples/rust-cpd-finder](../examples/rus
 
 ## Building and testing
 
-Requires Rust 1.96+ (the MSRV declared in `Cargo.toml`, enforced by the `msrv`
+Requires Rust 1.97+ (the MSRV declared in `Cargo.toml`, enforced by the `msrv`
 job in CI). Development uses the exact toolchain pinned in `rust-toolchain.toml`.
 
 ```bash
@@ -127,7 +141,7 @@ Compared against other copy/paste detectors (jscpd-rs, Duplo, Fallow, Simian, PM
 
 ## Documentation
 
-- **[docs/rust.md](../docs/rust.md)** — Full CLI reference, all options, reporters, baseline, summary, config file
+- **[docs/rust.md](../docs/rust.md)** — Full CLI reference, all options, reporters, baseline, summary, complexity, dashboard, config file
 - **[docs/ai-ready.md](../docs/ai-ready.md)** — AI reporter, agent skills, MCP server
 - **[docs/api.md](../docs/api.md)** — Rust API
 - **[docs/ci-and-hooks.md](../docs/ci-and-hooks.md)** — GitHub Action, Docker, pre-commit hooks

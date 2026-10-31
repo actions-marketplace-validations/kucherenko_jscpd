@@ -139,7 +139,7 @@ impl Reporter for ConsoleFullReporter {
                 let fa = &clone.fragment_a;
                 let fb = &clone.fragment_b;
 
-                print_clone_header(&self.style, &clone.format, clone.is_new);
+                print_clone_header(&self.style, clone);
                 print_clone_locations(&self.style, clone);
 
                 if self.blame {
@@ -151,9 +151,7 @@ impl Reporter for ConsoleFullReporter {
                 println!();
             },
         );
-        if let Some(summary) = ctx.summary {
-            crate::summary_render::print_summary(summary, &self.style);
-        }
+        crate::shared::print_appendices(ctx, &self.style);
         Ok(())
     }
 }
@@ -161,115 +159,16 @@ impl Reporter for ConsoleFullReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::ReportContext;
-    use crate::reporter::ReporterOptions;
-    use crate::shared::fixtures::{empty_ctx, one_clone_stats};
     use crate::{assert_empty_report_ok, assert_reporter_name};
-    use cpd_core::models::{BlameEntry, CpdClone, Fragment, Location};
-    use std::path::PathBuf;
-    use std::time::Duration;
+
+    // What console-full prints (snippets, `--blame` columns, truncation) is
+    // checked on real stdout in tests/console_output.rs.
 
     assert_empty_report_ok!(empty_clones_does_not_panic, ConsoleFullReporter);
-
-    fn make_clone_with_blame() -> CpdClone {
-        let loc = Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let blame = BlameEntry {
-            commit_sha: "abc12345".to_string(),
-            author: "Alice".to_string(),
-            timestamp: 1700000000,
-        };
-        let frag = Fragment {
-            source_id: "a.js".to_string(),
-            source_root: None,
-            start: loc.clone(),
-            end: loc,
-            range: [0, 10],
-            blame: Some(blame),
-        };
-        CpdClone {
-            format: "javascript".to_string(),
-            fragment_a: frag.clone(),
-            fragment_b: frag,
-            token_count: 50,
-            is_new: false,
-        }
-    }
-
-    fn make_clone_no_blame() -> CpdClone {
-        let loc = Location {
-            line: 1,
-            column: 0,
-            offset: 0,
-        };
-        let frag = Fragment {
-            source_id: "b.js".to_string(),
-            source_root: None,
-            start: loc.clone(),
-            end: loc,
-            range: [0, 10],
-            blame: None,
-        };
-        CpdClone {
-            format: "javascript".to_string(),
-            fragment_a: frag.clone(),
-            fragment_b: frag,
-            token_count: 30,
-            is_new: false,
-        }
-    }
-
-    #[test]
-    fn non_empty_clones_does_not_panic() {
-        let opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        let reporter = ConsoleFullReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &one_clone_stats(),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[make_clone_no_blame()], &ctx, &PathBuf::from("/tmp"));
-        assert!(result.is_ok());
-    }
-
-    fn run_blame_test(blame: bool) {
-        let mut opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        opts.blame = blame;
-        let reporter = ConsoleFullReporter::new(&opts);
-        let ctx = ReportContext {
-            stats: &one_clone_stats(),
-            duration: Duration::ZERO,
-            summary: None,
-        };
-        let result = reporter.report(&[make_clone_with_blame()], &ctx, &PathBuf::from("/tmp"));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn blame_shown_when_enabled() {
-        run_blame_test(true);
-    }
-
-    #[test]
-    fn blame_hidden_when_disabled() {
-        run_blame_test(false);
-    }
 
     assert_reporter_name!(
         name_returns_console_full,
         ConsoleFullReporter,
         "console-full"
     );
-
-    #[test]
-    fn no_colors_flag_respected() {
-        let mut opts = ReporterOptions::new(PathBuf::from("/tmp"));
-        opts.no_colors = true;
-        let reporter = ConsoleFullReporter::new(&opts);
-        let ctx = empty_ctx();
-        assert!(reporter.report(&[], &ctx, &PathBuf::from("/tmp")).is_ok());
-    }
 }

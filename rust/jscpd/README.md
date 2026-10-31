@@ -64,7 +64,8 @@ jscpd --list                                  # list all supported formats
 | `--mode` | `-m` | `mild` | Detection mode: `mild`, `weak`, `strict` |
 | `--skip-comments` | — | — | Alias for `--mode weak` |
 | `--format` | `-f` | all | Comma-separated formats to check |
-| `--ignore-pattern` | `-i` | — | Glob patterns to ignore |
+| `--ignore` | `-i` | — | File-level glob patterns to ignore (comma-separated); they match the whole path, so use `**/node_modules/**` for a directory |
+| `--ignore-pattern` | — | — | Code-level regex patterns; tokens overlapping a match are skipped during detection, e.g. `//\\s*cpd-disable` (comma-separated) |
 | `--reporters` | `-r` | `console` | Comma-separated reporters |
 | `--output` | `-o` | `report` | Output directory for file reporters |
 | `--config` | `-c` | — | Path to `.jscpd.json` config file |
@@ -101,7 +102,7 @@ Create `.jscpd.json` in your project root:
   "minTokens": 30,
   "minLines": 3,
   "format": ["javascript", "typescript", "python"],
-  "ignorePattern": ["node_modules", "dist", "*.min.js"],
+  "ignore": ["**/node_modules/**", "**/dist/**", "**/*.min.js"],
   "reporters": ["console", "json"],
   "output": "report",
   "threshold": 5,
@@ -151,6 +152,18 @@ println!("Found {} clones", result.clones.len());
 println!("Analyzed {} files", result.statistics.total.sources);
 ```
 
+## Running from Node.js
+
+`runJscpd(args, options)` runs the binary the way [`child_process.spawnSync`](https://nodejs.org/api/child_process.html#child_processspawnsynccommand-args-options) runs a command, without starting a Node.js process for the `jscpd` command first:
+
+```js
+const { runJscpd } = require("jscpd");
+
+const { status } = runJscpd(["src", "--silent", "--reporters", "json"]);
+```
+
+It throws an `Error` with `code === "JSCPD_NO_BINARY"` when there is no prebuilt binary for this platform or the platform package is not installed. A binary that is missing on disk comes back in `result.error` with code `ENOENT`, as from `spawnSync`. The v4 functions `jscpd()` and `detectClones()` are not exported: detection runs only in the binary.
+
 ## Coming from jscpd v4
 
 Flags, config file and reporters are the same. The differences:
@@ -158,7 +171,7 @@ Flags, config file and reporters are the same. The differences:
 | Feature | jscpd v4 (Node.js) | jscpd v5 (Rust) |
 |---------|--------------------|-----------------|
 | `--store` (LevelDB/Redis) | Persistent store for large repos | Not supported (flag ignored with a warning) |
-| Programming API | `jscpd()` Promise, `detectClones()` | Rust crate API; no Node.js API |
+| Programming API | `jscpd()` Promise, `detectClones()` | Rust crate API; from Node.js, `runJscpd()` runs the binary, `jscpd()` / `detectClones()` are gone |
 | `--reporters` | All v4 reporters | All except `full` (use `console-full`) |
 | Output filenames | `jscpd-report.json`, `html/` dir | `jscpd-report.*` prefix |
 

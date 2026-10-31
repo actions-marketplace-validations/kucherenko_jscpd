@@ -49,6 +49,10 @@ inputs:
     description: "Output directory for file reporters"
     required: false
     default: "report"
+  report-name:
+    description: "Base name of the report files, without the extension (jscpd --report-name; default jscpd-report). The action reads <report-name>.json and .sarif back, so set it here, not only as reportName in .jscpd.json"
+    required: false
+    default: ""
   threshold:
     description: "Maximum duplication percentage before exit 1"
     required: false
@@ -65,8 +69,16 @@ inputs:
     description: "Exit 1 when new clones are found (requires baseline or baseline-from-ref). Use 'true' for zero tolerance, or an integer N to allow up to N new clones"
     required: false
     default: ""
+  fail-on-empty:
+    description: "Exit 1 when the scan analyzes no files: the paths exist but nothing matched the format, ignore or pattern filters"
+    required: false
+    default: "false"
   baseline-from-ref:
     description: "Compare against an ephemeral baseline built from a git ref's tree (e.g. origin/main); needs the ref fetched (fetch-depth: 0). Conflicts with baseline"
+    required: false
+    default: ""
+  history:
+    description: "Duplication and health trend over git history: 'true' for the last 30 commits of the branch (or the config's history range), or a range of commits to scan (e.g. v5.0.0..HEAD); 'false' leaves it off. Prints charts and a table in the log and needs the commits fetched (fetch-depth: 0, or 30 for 'true')"
     required: false
     default: ""
   blame:
@@ -93,6 +105,30 @@ inputs:
     description: "Ignore case of symbols (experimental)"
     required: false
     default: "false"
+  ignore-identifiers:
+    description: "Treat identifiers as equal (Type-2 clones: renamed variables, functions, types): 'consistent' lets a name stand for one name on the other side only, 'blind' lets any name match any other, in similarity too, 'true' takes the matching from the config's ignoreIdentifiers, else consistent"
+    required: false
+    default: "false"
+  ignore-literals:
+    description: "Treat all string and numeric literals as equal"
+    required: false
+    default: "false"
+  ignore-annotations:
+    description: "Skip annotations and decorators (@Name, @Name(...))"
+    required: false
+    default: "false"
+  max-gap-lines:
+    description: "Merge clones separated by at most N unmatched lines into one near-miss clone (Type-3); 0 disables"
+    required: false
+    default: "0"
+  similarity:
+    description: "Report pairs of functions whose normalized syntax trees share at least this ratio of their subtrees (a number in (0, 1], such as 0.8) as near-miss clones. JavaScript, TypeScript, Python, Java, Kotlin, Scala, C#, Go, Rust, C, C++, PHP, Ruby, Swift and Clojure; test files are left out. Not set: the config's value, else off"
+    required: false
+    default: ""
+  min-nodes:
+    description: "The fewest nodes of a normalized syntax tree a function needs for similarity to compare it. Not set: the config's value, else 20"
+    required: false
+    default: ""
   follow-symlinks:
     description: "Follow symbolic links"
     required: false
@@ -110,15 +146,15 @@ inputs:
     required: false
     default: ""
   formats-names:
-    description: "Custom format-to-filename mappings (e.g. makefile:Makefile,GNUmakefile;docker:Dockerfile)"
+    description: "Custom format-to-filename mappings (e.g. python:Tiltfile,BUCK;ruby:Buildfile)"
     required: false
     default: ""
   version:
-    description: "Version of jscpd to install (default: latest)"
+    description: "Version of jscpd to install. Empty (the default) installs the release this action ref belongs to, so pinning the action to a release tag or its SHA pins jscpd too; a commit between releases gets the release before it. 'latest' installs the newest release"
     required: false
-    default: "latest"
+    default: ""
   install-prefix:
-    description: "Installation directory for the cpd binary (default: /usr/local/bin on Linux/macOS, npm global bin on Windows)"
+    description: "Installation directory for the jscpd binary on Linux/macOS (default: ~/.local/bin). Windows installs jscpd with npm and ignores it"
     required: false
     default: ""
   skip-install:
@@ -167,79 +203,107 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Install jscpd (Linux/macOS)
-      if: runner.os != 'Windows' && inputs.skip-install != 'true'
+    - name: Install jscpd
+      if: inputs.skip-install != 'true'
       shell: bash
       env:
         JSCPD_VERSION: ${{ inputs.version }}
         JSCPD_PREFIX: ${{ inputs.install-prefix }}
       run: |
-        ARGS=""
-        if [ -n "$JSCPD_VERSION" ] && [ "$JSCPD_VERSION" != "latest" ]; then
-          ARGS="$ARGS --version $JSCPD_VERSION"
-        fi
-        if [ -n "$JSCPD_PREFIX" ]; then
-          ARGS="$ARGS --prefix $JSCPD_PREFIX"
-        fi
-
-        # Try install script first (downloads from GitHub Releases, falls back to npm)
-        for attempt in 1 2 3; do
-          if curl -fsSL --retry 3 --retry-delay 5 https://jscpd.dev/install.sh | bash -s -- $ARGS; then
-            break
-          fi
-          echo "Install attempt $attempt failed, retrying in 10s..."
-          sleep 10
-        done
-
-        # Fallback: if install script failed, try npm directly
-        if ! command -v cpd >/dev/null 2>&1 && ! command -v jscpd >/dev/null 2>&1; then
-          echo "Install script failed, falling back to npm install..."
-          if [ -n "$JSCPD_VERSION" ] && [ "$JSCPD_VERSION" != "latest" ]; then
-            npm install -g "jscpd@$JSCPD_VERSION" || npm install -g "cpd@$JSCPD_VERSION"
+        # An empty version means the release this action ref belongs to, the
+        # one rust/package.json names, so pinning the action to a release tag
+        # or its SHA pins jscpd too.
+        version="${JSCPD_VERSION#v}"
+        from_ref=""
+        if [ -z "$version" ]; then
+          manifest="$GITHUB_ACTION_PATH/rust/package.json"
+          version=$(node -p 'require(process.argv[1]).version' "$manifest" 2>/dev/null) || version=""
+          if printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            from_ref=1
+            echo "Installing jscpd $version, the release of this action ref"
           else
-            npm install -g jscpd || npm install -g cpd
+            echo "::warning::Could not read the jscpd version from $manifest; installing the latest release"
+            version=latest
           fi
         fi
 
-    - name: Install jscpd (Windows)
-      if: runner.os == 'Windows' && inputs.skip-install != 'true'
-      shell: pwsh
-      env:
-        JSCPD_VERSION: ${{ inputs.version }}
-      run: |
-        $version = $env:JSCPD_VERSION
-        $pkgs = if ($version -eq "latest" -or [string]::IsNullOrEmpty($version)) {
-          @("jscpd", "cpd")
-        } else {
-          @("jscpd@$version", "cpd@$version")
+        # install.sh downloads the release binary on Linux and macOS, and npm
+        # is the fallback there and the only way on Windows. curl retries
+        # transient errors only, a 403 or 404 for install.sh stays one.
+        installed_by=npm
+        install_jscpd() {
+          local want="$1" installer=""
+          local args=()
+          if [ "$want" != latest ]; then
+            # --force, or install.sh keeps a newer jscpd that an earlier job
+            # left in the prefix.
+            args+=(--version "$want" --force)
+          fi
+          if [ -n "$JSCPD_PREFIX" ]; then
+            args+=(--prefix "$JSCPD_PREFIX")
+          fi
+          if [ "$RUNNER_OS" != Windows ]; then
+            installer=$(mktemp)
+            if curl -fsSL --retry 3 --retry-delay 5 -o "$installer" https://jscpd.dev/install.sh \
+              && bash "$installer" "${args[@]}"; then
+              rm -f "$installer"
+              installed_by=install.sh
+              return 0
+            fi
+            rm -f "$installer"
+            echo "install.sh failed, installing jscpd from npm"
+          fi
+          if [ "$want" = latest ]; then
+            npm install -g jscpd
+          else
+            npm install -g "jscpd@$want"
+          fi
         }
-        $installed = $false
-        foreach ($pkg in $pkgs) {
-          try {
-            npm install -g $pkg
-            $installed = $true
-            break
-          } catch {
-            Write-Host "npm install -g $pkg failed, trying next..."
-            Start-Sleep -Seconds 5
-          }
-        }
-        if (-not $installed) {
-          # Retry once
-          foreach ($pkg in $pkgs) {
-            try {
-              npm install -g $pkg
-              $installed = $true
-              break
-            } catch {
-              Write-Host "npm install -g $pkg retry failed"
-            }
-          }
-        }
-        if (-not $installed) {
-          Write-Error "Failed to install jscpd via npm"
+
+        if ! install_jscpd "$version"; then
+          if [ -z "$from_ref" ]; then
+            echo "::error::Could not install jscpd $version"
+            exit 1
+          fi
+          # A release commit raises the version before the release is out, so
+          # during a release run @master names a jscpd nobody can install yet.
+          echo "::warning::Could not install jscpd $version, the release of this action ref; installing the latest release"
+          version=latest
+          if ! install_jscpd latest; then
+            echo "::error::Could not install jscpd"
+            exit 1
+          fi
+        fi
+
+        # The prefix is not on PATH on every runner (macOS, a custom
+        # install-prefix), and another jscpd can come first.
+        if [ "$installed_by" = install.sh ]; then
+          prefix="${JSCPD_PREFIX:-${CPD_INSTALL_PREFIX:-$HOME/.local/bin}}"
+          case "$prefix" in
+            '~') prefix="$HOME" ;;
+            '~/'*) prefix="$HOME/${prefix#\~/}" ;;
+          esac
+          prefix="${prefix%/}"
+          if [ "$(command -v jscpd)" != "$prefix/jscpd" ]; then
+            echo "$prefix" >> "$GITHUB_PATH"
+            PATH="$prefix:$PATH"
+          fi
+        fi
+
+        if ! command -v jscpd >/dev/null 2>&1; then
+          echo "::error::jscpd is installed but not on PATH"
           exit 1
-        }
+        fi
+        got=$(jscpd --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1p') || got=""
+        echo "Using $(command -v jscpd), jscpd ${got:-of an unknown version}"
+        asked="${version%%[-+]*}"
+        case "$asked" in
+          *.*.*)
+            if [ "$got" != "$asked" ]; then
+              echo "::warning::Asked for jscpd $version, but $(command -v jscpd) is jscpd ${got:-of an unknown version}"
+            fi
+            ;;
+        esac
 
     - name: Run jscpd
       id: run-jscpd
@@ -256,17 +320,26 @@ runs:
         INPUT_IGNORE_PATTERN: ${{ inputs.ignore-pattern }}
         INPUT_REPORTERS: ${{ inputs.reporters }}
         INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_REPORT_NAME: ${{ inputs.report-name }}
         INPUT_THRESHOLD: ${{ inputs.threshold }}
         INPUT_BASELINE: ${{ inputs.baseline }}
         INPUT_UPDATE_BASELINE: ${{ inputs.update-baseline }}
         INPUT_FAIL_ON_NEW_CLONES: ${{ inputs.fail-on-new-clones }}
+        INPUT_FAIL_ON_EMPTY: ${{ inputs.fail-on-empty }}
         INPUT_BASELINE_FROM_REF: ${{ inputs.baseline-from-ref }}
+        INPUT_HISTORY: ${{ inputs.history }}
         INPUT_BLAME: ${{ inputs.blame }}
         INPUT_EXIT_CODE: ${{ inputs.exit-code }}
         INPUT_PATTERN: ${{ inputs.pattern }}
         INPUT_MAX_SIZE: ${{ inputs.max-size }}
         INPUT_SKIP_LOCAL: ${{ inputs.skip-local }}
         INPUT_IGNORE_CASE: ${{ inputs.ignore-case }}
+        INPUT_IGNORE_IDENTIFIERS: ${{ inputs.ignore-identifiers }}
+        INPUT_IGNORE_LITERALS: ${{ inputs.ignore-literals }}
+        INPUT_IGNORE_ANNOTATIONS: ${{ inputs.ignore-annotations }}
+        INPUT_MAX_GAP_LINES: ${{ inputs.max-gap-lines }}
+        INPUT_SIMILARITY: ${{ inputs.similarity }}
+        INPUT_MIN_NODES: ${{ inputs.min-nodes }}
         INPUT_FOLLOW_SYMLINKS: ${{ inputs.follow-symlinks }}
         INPUT_NO_GITIGNORE: ${{ inputs.no-gitignore }}
         INPUT_ABSOLUTE: ${{ inputs.absolute }}
@@ -329,6 +402,9 @@ runs:
         # Reporters and output
         ARGS+=("--reporters" "$REPORTERS")
         ARGS+=("--output" "$INPUT_OUTPUT")
+        if [ -n "$INPUT_REPORT_NAME" ]; then
+          ARGS+=("--report-name" "$INPUT_REPORT_NAME")
+        fi
 
         # Threshold
         if [ -n "$INPUT_THRESHOLD" ]; then
@@ -343,6 +419,16 @@ runs:
           fi
         elif [ -n "$INPUT_BASELINE_FROM_REF" ]; then
           ARGS+=("--baseline-from-ref" "$INPUT_BASELINE_FROM_REF")
+        fi
+        # History: empty or 'false'=omit, 'true'=no range (the last 30 commits),
+        # else a range. The value goes after '=': a path in extra-args after a
+        # bare --history would be read as its range.
+        if [ -n "$INPUT_HISTORY" ] && [ "$INPUT_HISTORY" != "false" ]; then
+          if [ "$INPUT_HISTORY" = "true" ]; then
+            ARGS+=("--history=")
+          else
+            ARGS+=("--history=$INPUT_HISTORY")
+          fi
         fi
         # Fail on new clones: empty=omit, 'true'=bare flag (N=0), integer=value
         if [ -n "$INPUT_FAIL_ON_NEW_CLONES" ]; then
@@ -381,8 +467,30 @@ runs:
         if [ "$INPUT_SKIP_LOCAL" = "true" ]; then
           ARGS+=("--skip-local")
         fi
+        if [ "$INPUT_FAIL_ON_EMPTY" = "true" ]; then
+          ARGS+=("--fail-on-empty")
+        fi
         if [ "$INPUT_IGNORE_CASE" = "true" ]; then
           ARGS+=("--ignore-case")
+        fi
+        case "$INPUT_IGNORE_IDENTIFIERS" in
+          true) ARGS+=("--ignore-identifiers") ;;
+          consistent|blind) ARGS+=("--ignore-identifiers=$INPUT_IGNORE_IDENTIFIERS") ;;
+        esac
+        if [ "$INPUT_IGNORE_LITERALS" = "true" ]; then
+          ARGS+=("--ignore-literals")
+        fi
+        if [ "$INPUT_IGNORE_ANNOTATIONS" = "true" ]; then
+          ARGS+=("--ignore-annotations")
+        fi
+        if [ -n "$INPUT_MAX_GAP_LINES" ] && [ "$INPUT_MAX_GAP_LINES" != "0" ]; then
+          ARGS+=("--max-gap-lines" "$INPUT_MAX_GAP_LINES")
+        fi
+        if [ -n "$INPUT_SIMILARITY" ]; then
+          ARGS+=("--similarity=$INPUT_SIMILARITY")
+        fi
+        if [ -n "$INPUT_MIN_NODES" ]; then
+          ARGS+=("--min-nodes" "$INPUT_MIN_NODES")
         fi
         if [ "$INPUT_FOLLOW_SYMLINKS" = "true" ]; then
           ARGS+=("--follow-symlinks")
@@ -416,7 +524,7 @@ runs:
       id: parse-output
       if: always()
       shell: bash
-      run: node "${{ github.action_path }}/.github/actions/jscpd/parse-output.js" "${{ inputs.output }}"
+      run: node "${{ github.action_path }}/.github/actions/jscpd/parse-output.js" "${{ inputs.output }}" "${{ inputs.report-name }}"
 
     - name: Upload SARIF to GitHub Code Scanning
       if: inputs.upload-sarif == 'true' && always() && steps.parse-output.outputs.sarif-path != ''
